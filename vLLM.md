@@ -1,66 +1,193 @@
-# vLLM Prefill-Decode Disaggregation Recipe
+# vLLM Prefill-Decode Disaggregation Recipe with Heterogeneous Hardware
 
 ## Architecture Overview
 
-This recipe sets up a disaggregated prefill-decode architecture using:
+This recipe sets up a **heterogeneous disaggregated prefill-decode architecture** using:
 - **vLLM**: Serving engine for LLM inference
 - **LMCache**: KV cache management system
 - **NIXL**: High-performance transport layer for KV cache transfer
 - **Ceph Storage**: Persistent storage backend for KV cache (S3 API or NFS over RDMA)
+- **AMD MI300X**: Prefill nodes (memory-bandwidth optimized)
+- **Intel Gaudi3**: Decode nodes (compute-efficient, cost-optimized)
+
+### KVCache-Centric Disaggregated Architecture
+
+This system implements a **KVCache-centric disaggregated architecture** that separates prefill and decoding operations around a centralized distributed KV cache system.
 
 ```
-┌─────────────────────────────┐          ┌─────────────────────────────┐
-│      Prefill Node           │          │       Decode Node           │
-│  ┌───────────────────────┐  │          │  ┌───────────────────────┐  │
-│  │   vLLM (Producer)     │  │          │  │   vLLM (Consumer)     │  │
-│  └──────────┬────────────┘  │          │  └──────────┬────────────┘  │
-│             │               │          │             │               │
-│  ┌──────────▼────────────┐  │◄─ NIXL ─►│  ┌──────────▼────────────┐  │
-│  │   LMCache L1 (GPU)    │  │          │  │   LMCache L1 (GPU)    │  │
-│  └──────────┬────────────┘  │          │  └──────────┬────────────┘  │
-│             │               │          │             │               │
-│  ┌──────────▼────────────┐  │          │  ┌──────────▼────────────┐  │
-│  │   LMCache L1 (CPU)    │  │          │  │   LMCache L1 (CPU)    │  │
-│  └──────────┬────────────┘  │          │  └──────────┬────────────┘  │
-│             │               │          │             │               │
-│  ┌──────────▼────────────┐  │          │  ┌──────────▼────────────┐  │
-│  │  Local Disk (optional)│  │          │  │  Local Disk (optional)│  │
-│  └──────────┬────────────┘  │          │  └──────────┬────────────┘  │
-└─────────────┼───────────────┘          └─────────────┼───────────────┘
-              │                                        │
-              └─────────────────────┬──────────────────┘
-                                    │
-                    ┌───────────────▼────────────────┐
-                    │  Ceph Storage (L2 - Remote)    │
-                    │  ┌──────────────────────────┐  │
-                    │  │ Option A: S3 API         │  │
-                    │  │   • Latency: 10-100ms    │  │
-                    │  │   • Throughput: 100MB-1GB/s│ │
-                    │  └──────────────────────────┘  │
-                    │  ┌──────────────────────────┐  │
-                    │  │ Option B: NFS/RDMA       │  │
-                    │  │   • Latency: 1-5ms       │  │
-                    │  │   • Throughput: 10-50GB/s│  │
-                    │  └──────────────────────────┘  │
-                    └────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                    KVCache-Centric Disaggregated Architecture                           │
+│                          (MI300X Prefill + Gaudi3 Decode)                               │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────┐                                    ┌──────────────────────┐
+│  KVCache-centric     │                                    │  Prefill Stage       │
+│     Conductor        │                                    │  Optimization        │
+│  (Global Scheduler)  │                                    │                      │
+│                      │                                    │  Goal: Maximize      │
+│ ┌──────────────────┐ │        ╔════════════════════╗      │   Cache Reuse        │
+│ │ Cache-aware      │ │        ║  PREFILL POOL      ║      │                      │
+│ │ Prefill Scheduler│◄┼───────►║  (AMD MI300X)      ║      │  Constraints:        │
+│ └──────────────────┘ │        ║                    ║      │  • TTFT SLO          │
+│                      │        ║ ┌────────────────┐ ║      │  • MFU > threshold   │
+│ ┌──────────────────┐ │        ║ │ GPU/HBM3       │ ║      │  • KVCache < DRAM    │
+│ │ KVCache Balance  │ │        ║ │ 192GB          │ ║      │                      │
+│ │ Scheduler        │◄┼────┐   ║ │ - Paged Cache  │ ║      └──────────────────────┘
+│ └──────────────────┘ │    │   ║ │ - Local Chunked│ ║
+│                      │    │   ║ │   Prefill Sched│ ║
+│ ┌──────────────────┐ │    │   ║ └────────┬───────┘ ║
+│ │ Load-balance     │ │    │   ║          │         ║
+│ │ Decoding         │◄┼───┐│   ║ ┌────────▼───────┐ ║
+│ │ Scheduler        │ │   ││   ║ │ CPU/DRAM/SSD   │ ║
+│ └──────────────────┘ │   ││   ║ │ Distributed    │ ║
+│                      │   ││   ║ │ KVCache Pool   │ ║
+└──────────────────────┘   ││   ║ └────────┬───────┘ ║
+                           ││   ╚══════════╪═════════╝
+                           ││              │
+                           ││   ┌──────────▼─────────┐
+                           ││   │  KVCache Transfer  │
+                           │└──►│      Engine        │◄─── RDMA/NIXL
+                           │    │  (Ceph NFS/RDMA)   │     High-speed
+                           │    └──────────┬─────────┘     Transfer
+                           │               │
+                           │    ╔══════════╪═════════╗
+                           │    ║ ┌────────▼───────┐ ║
+                           │    ║ │ CPU/DRAM/SSD   │ ║
+                           │    ║ │ Distributed    │ ║
+                           │    ║ │ KVCache Pool   │ ║
+                           │    ║ └────────┬───────┘ ║
+                           │    ║          │         ║     ┌──────────────────────┐
+                           │    ║ ┌────────▼───────┐ ║     │  Decode Stage        │
+                           │    ║ │ GPU/HBM2e      │ ║     │  Optimization        │
+                           │    ║ │ 128GB          │ ║     │                      │
+                           └───►║ │ - Paged Cache  │ ║     │  Goal: Maximize      │
+                                ║ │ - Local Decode │ ║     │   Throughput         │
+                                ║ │   Scheduler    │ ║     │                      │
+                                ║ └────────────────┘ ║     │  Constraints:        │
+                                ║                    ║     │  • TBT SLO           │
+                                ║  DECODING POOL     ║     │  • KVCache < VRAM    │
+                                ║  (Intel Gaudi3)    ║     │                      │
+                                ╚════════════════════╝     └──────────────────────┘
+
+Data Flow:
+  ━━━►  High-priority request path (RDMA/NIXL)
+  ────► Control/scheduling signals
+
+Key Innovation: "KVCaching is the key enabler for Efficient Decode"
+  • Reduce from quadratic complexity to linear, move bottleneck from FLOPs to memory bw/capacity
+  • Harness underutilized CPU, DRAM, SSD resources for distributed KV cache
+  • Enable efficient near-GPU prefix caching across heterogeneous hardware
+  • Significantly enhance global cache capacity and inter-node transfer bandwidth
+  • Process 100B+ tokens daily across thousands of nodes (Mooncake production scale)
+```
+
+### Why Heterogeneous Hardware?
+
+This architecture leverages the strengths of different hardware for different workloads:
+
+**Prefill Phase (AMD MI300X):**
+- **Memory-bound workload**: Prefill requires loading and processing long input sequences
+- **MI300X advantages**:
+  - 192GB HBM3 memory (2-2.4× larger than typical GPUs)
+  - 5.3 TB/s memory bandwidth (excellent for attention operations)
+  - Can handle longer context windows (128K+ tokens)
+  - Better batch processing of large prompts
+- **Cost justification**: Higher cost per node justified by massive throughput gains
+
+**Decode Phase (Intel Gaudi3):**
+- **Compute-bound workload**: Decode generates one token at a time with smaller KV cache access
+- **Gaudi3 advantages**:
+  - 128GB HBM2e sufficient for most decode scenarios
+  - Excellent compute efficiency for autoregressive generation
+  - Lower power consumption per token
+  - Better cost per token for decode workloads
+- **Cost optimization**: More cost-effective than premium GPUs for decode-only tasks
+
+```
+┌──────────────────────────────────┐          ┌──────────────────────────────────┐
+│    Prefill Node (AMD MI300X)     │          │    Decode Node (Intel Gaudi3)    │
+│  192GB HBM3, 5.3TB/s bandwidth   │          │   128GB HBM2e, 24 Tensor cores   │
+│  ┌────────────────────────────┐  │          │  ┌────────────────────────────┐  │
+│  │  vLLM (Producer, ROCm)     │  │          │  │  vLLM (Consumer, SynapseAI)│  │
+│  └────────────┬───────────────┘  │          │  └────────────┬───────────────┘  │
+│               │                  │          │               │                  │
+│  ┌────────────▼───────────────┐  │◄─ NIXL ─►│  ┌────────────▼───────────────┐  │
+│  │  LMCache L1 (MI300X mem)   │  │   RDMA   │  │  LMCache L1 (Gaudi3 mem)   │  │
+│  │  Capacity: ~180GB usable   │  │          │  │  Capacity: ~120GB usable   │  │
+│  └────────────┬───────────────┘  │          │  └────────────┬───────────────┘  │
+│               │                  │          │               │                  │
+│  ┌────────────▼───────────────┐  │          │  ┌────────────▼───────────────┐  │
+│  │   LMCache L1 (CPU RAM)     │  │          │  │   LMCache L1 (CPU RAM)     │  │
+│  └────────────┬───────────────┘  │          │  └────────────┬───────────────┘  │
+│               │                  │          │               │                  │
+│  ┌────────────▼───────────────┐  │          │  ┌────────────▼───────────────┐  │
+│  │  Local Disk (NVMe, opt.)   │  │          │  │  Local Disk (NVMe, opt.)   │  │
+│  └────────────┬───────────────┘  │          │  └────────────┬───────────────┘  │
+└───────────────┼──────────────────┘          └───────────────┼──────────────────┘
+                │                                             │
+                └────────────────────┬────────────────────────┘
+                                     │
+                     ┌───────────────▼────────────────┐
+                     │  Ceph Storage (L2 - Remote)    │
+                     │  ┌──────────────────────────┐  │
+                     │  │ Option A: S3 API         │  │
+                     │  └──────────────────────────┘  │
+                     │  ┌──────────────────────────┐  │
+                     │  │ Option B: NFS/RDMA       │  │
+                     │  └──────────────────────────┘  │
+                     └────────────────────────────────┘
 
 Cache Hierarchy:
-  L1: GPU memory (fastest, ~GB)
+  L1: Device memory (MI300X: ~180GB, Gaudi3: ~120GB)
   L1: CPU memory (fast, ~10-100GB, LRU eviction)
   L1: Local disk (medium, ~TB, optional)
   L2: Remote storage (Ceph S3 or NFS/RDMA, unlimited, persistent)
       - S3 API: Simple, object storage, 10-100ms latency
       - NFS/RDMA: High performance, filesystem, 1-5ms latency
+
+Hardware Specifications:
+  Prefill (MI300X):  8 GCDs, 192GB HBM3, 5.3TB/s, ROCm stack
+  Decode (Gaudi3):   24 Tensor cores, 128GB HBM2e, SynapseAI stack
 ```
 
 ## Prerequisites
 
-1. **Hardware**: Intel Gaudi 2/3 AI accelerators or NVIDIA GPUs
-2. **Software**:
-   - Docker with habanalabs-container-runtime (for Gaudi) or nvidia-docker (for NVIDIA)
-   - Python 3.10+
-   - Ceph cluster with S3 gateway configured OR CephFS with NFS-Ganesha
-3. **Network**: High-bandwidth network between prefill and decode nodes (RDMA recommended for best performance)
+### Hardware Requirements
+
+**Prefill Nodes:**
+- **AMD MI300X** accelerators (192GB HBM3)
+- Minimum: 1x MI300X per node
+- Recommended: 4-8x MI300X for tensor parallelism
+- Host: 256GB+ RAM, 2TB+ NVMe SSD
+- RDMA-capable NICs (for NIXL and NFS/RDMA)
+
+**Decode Nodes:**
+- **Intel Gaudi3** accelerators (128GB HBM2e)
+- Minimum: 1x Gaudi3 per node
+- Recommended: 4-8x Gaudi3 for tensor parallelism
+- Host: 128GB+ RAM, 1TB+ NVMe SSD
+- RDMA-capable NICs (for NIXL and NFS/RDMA)
+
+### Software Requirements
+
+**Prefill Nodes (MI300X):**
+- Docker with AMD ROCm support
+- ROCm 6.0+ (included in vLLM Docker image)
+- Python 3.10+
+- Ceph cluster with S3 gateway OR CephFS with NFS-Ganesha
+
+**Decode Nodes (Gaudi3):**
+- Docker with habanalabs-container-runtime
+- Intel Gaudi Software Suite (SynapseAI) 1.18+
+- Python 3.10+
+- Ceph cluster access (same as prefill nodes)
+
+### Network Requirements
+
+- **High-bandwidth network**: 100Gbps+ between prefill and decode nodes
+- **RDMA support**: InfiniBand or RoCE (recommended for NIXL and NFS/RDMA)
+- **Low latency**: <10μs for best NIXL performance
+- **Connectivity**: All nodes must reach Ceph storage backend
 
 ## Step 1: Setup Ceph Storage Backend
 
@@ -224,26 +351,54 @@ rm /mnt/ceph-nfs-kv-cache/test.dat
 
 ## Step 2: Install vLLM with Docker
 
-### 2.1 Pull vLLM Docker Image
+### 2.1 Pull vLLM Docker Images
 
-For Intel Gaudi:
+**For Prefill Nodes (AMD MI300X with ROCm):**
 ```bash
-docker pull vault.habana.ai/gaudi-docker/1.22.0/ubuntu22.04/habanalabs/pytorch-installer-2.7.1:latest
+# vLLM with ROCm support for MI300X
+docker pull rocm/vllm:latest
+# OR build from source with ROCm 6.0+
 ```
 
-For NVIDIA GPUs:
+**For Decode Nodes (Intel Gaudi3):**
 ```bash
-docker pull vllm/vllm-openai:latest
+# Habana base image with PyTorch
+docker pull vault.habana.ai/gaudi-docker/1.18.0/ubuntu22.04/habanalabs/pytorch-installer-2.5.0:latest
 ```
 
-### 2.2 Install LMCache and NIXL
+### 2.2 Build Custom Images with LMCache and NIXL
 
-Create a Dockerfile to extend the base image:
+**Prefill Dockerfile (MI300X + ROCm):**
 
 ```dockerfile
-# Dockerfile.vllm-disagg
-FROM vault.habana.ai/gaudi-docker/1.22.0/ubuntu22.04/habanalabs/pytorch-installer-2.7.1:latest
-# OR: FROM vllm/vllm-openai:latest
+# Dockerfile.vllm-prefill-mi300x
+FROM rocm/vllm:latest
+
+# Install LMCache
+RUN pip install lmcache
+
+# Install NIXL connector (if available for ROCm)
+RUN pip install nixl-connector || echo "NIXL may require manual setup for ROCm"
+
+# Install S3 dependencies
+RUN pip install boto3 botocore
+
+# ROCm-specific optimizations
+ENV HSA_FORCE_FINE_GRAIN_PCIE=1
+ENV ROCM_HOME=/opt/rocm
+ENV HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+WORKDIR /workspace
+```
+
+**Decode Dockerfile (Gaudi3 + SynapseAI):**
+
+```dockerfile
+# Dockerfile.vllm-decode-gaudi3
+FROM vault.habana.ai/gaudi-docker/1.18.0/ubuntu22.04/habanalabs/pytorch-installer-2.5.0:latest
+
+# Install vLLM with Gaudi support
+RUN pip install vllm --extra-index-url https://download.habana.ai/
 
 # Install LMCache
 RUN pip install lmcache
@@ -254,28 +409,54 @@ RUN pip install nixl-connector
 # Install S3 dependencies
 RUN pip install boto3 botocore
 
+# Gaudi-specific environment
+ENV HABANA_VISIBLE_DEVICES=all
+ENV PT_HPU_LAZY_MODE=1
+
 WORKDIR /workspace
 ```
 
-Build the image:
+### 2.3 Build the Images
+
+**Build prefill image:**
 ```bash
-docker build -f Dockerfile.vllm-disagg -t vllm-disagg:latest .
+docker build -f Dockerfile.vllm-prefill-mi300x -t vllm-prefill-mi300x:latest .
 ```
 
-## Step 3: Configure Prefill Node
+**Build decode image:**
+```bash
+docker build -f Dockerfile.vllm-decode-gaudi3 -t vllm-decode-gaudi3:latest .
+```
+
+### 2.4 Verify Hardware Access
+
+**Verify MI300X access:**
+```bash
+docker run --rm --device=/dev/kfd --device=/dev/dri \
+  --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+  vllm-prefill-mi300x:latest rocm-smi
+```
+
+**Verify Gaudi3 access:**
+```bash
+docker run --rm --runtime=habana -e HABANA_VISIBLE_DEVICES=all \
+  vllm-decode-gaudi3:latest hl-smi
+```
+
+## Step 3: Configure Prefill Node (AMD MI300X)
 
 ### 3.1 Create Prefill Configuration
 
-Create `prefill_config.json`:
+Create `prefill_config.json` for MI300X:
 
 ```json
 {
-  "model": "meta-llama/Llama-3-70b-hf",
+  "model": "meta-llama/Llama-3.1-70b",
   "tensor_parallel_size": 4,
   "pipeline_parallel_size": 1,
-  "max_num_seqs": 256,
-  "max_model_len": 4096,
-  "gpu_memory_utilization": 0.9,
+  "max_num_seqs": 512,
+  "max_model_len": 8192,
+  "gpu_memory_utilization": 0.90,
   "enable_chunked_prefill": true,
   "enable_prefix_caching": true,
   "kv_connector": "NixlConnector",
@@ -284,7 +465,7 @@ Create `prefill_config.json`:
   "kv_parallel_size": 1,
   "nixl_transport": "rdma",
   "nixl_port": 50051,
-  "kv_buffer_size": "10GB",
+  "kv_buffer_size": "20GB",
   "kv_cache_backend": "s3",
   "s3_endpoint_url": "${S3_ENDPOINT_URL}",
   "s3_bucket_name": "${S3_BUCKET_NAME}",
@@ -292,30 +473,40 @@ Create `prefill_config.json`:
 }
 ```
 
-### 3.2 Launch Prefill Instance
+**Configuration Notes for MI300X:**
+- `max_num_seqs: 512`: Higher batch size leverages 192GB memory
+- `max_model_len: 8192`: Longer context enabled by large memory bandwidth
+- `gpu_memory_utilization: 0.90`: Conservative due to 192GB capacity
+- `kv_buffer_size: 20GB`: Larger buffer for high-throughput KV transfer
+
+### 3.2 Launch Prefill Instance (MI300X)
 
 ```bash
-# Start prefill node
+# Start prefill node on MI300X
 docker run -d \
-  --name vllm-prefill \
-  --runtime=habana \
-  -e HABANA_VISIBLE_DEVICES=all \
-  -e OMPI_MCA_btl_vader_single_copy_mechanism=none \
-  --cap-add=sys_nice \
+  --name vllm-prefill-mi300x \
+  --device=/dev/kfd \
+  --device=/dev/dri \
+  --group-add video \
+  --cap-add=SYS_PTRACE \
+  --security-opt seccomp=unconfined \
   --net=host \
   --ipc=host \
+  -e HSA_FORCE_FINE_GRAIN_PCIE=1 \
+  -e ROCM_HOME=/opt/rocm \
+  -e HIP_VISIBLE_DEVICES=0,1,2,3 \
   -e AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID} \
   -e AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY} \
   -e S3_ENDPOINT_URL=${S3_ENDPOINT_URL} \
   -e S3_BUCKET_NAME=${S3_BUCKET_NAME} \
   -v $(pwd)/prefill_config.json:/workspace/config.json \
-  vllm-disagg:latest \
+  vllm-prefill-mi300x:latest \
   python -m vllm.entrypoints.openai.api_server \
-    --model meta-llama/Llama-3-70b-hf \
+    --model meta-llama/Llama-3.1-70b \
     --tensor-parallel-size 4 \
-    --max-num-seqs 256 \
-    --max-model-len 4096 \
-    --gpu-memory-utilization 0.9 \
+    --max-num-seqs 512 \
+    --max-model-len 8192 \
+    --gpu-memory-utilization 0.90 \
     --enable-chunked-prefill \
     --enable-prefix-caching \
     --kv-connector NixlConnector \
@@ -325,24 +516,31 @@ docker run -d \
     --nixl-transport rdma \
     --nixl-port 50051 \
     --nixl-proxy-host prefill-node-ip \
-    --kv-buffer-size 10GB \
-    --port 8000
+    --kv-buffer-size 20GB \
+    --port 8000 \
+    --trust-remote-code
 ```
 
-## Step 4: Configure Decode Node
+**MI300X-Specific Flags:**
+- `--device=/dev/kfd --device=/dev/dri`: ROCm device access
+- `--group-add video`: Required for ROCm
+- `HSA_FORCE_FINE_GRAIN_PCIE=1`: Optimize PCIe transfers
+- `HIP_VISIBLE_DEVICES`: Control which MI300X GPUs are visible
+
+## Step 4: Configure Decode Node (Intel Gaudi3)
 
 ### 4.1 Create Decode Configuration
 
-Create `decode_config.json`:
+Create `decode_config.json` for Gaudi3:
 
 ```json
 {
-  "model": "meta-llama/Llama-3-70b-hf",
+  "model": "meta-llama/Llama-3.1-70b",
   "tensor_parallel_size": 4,
   "pipeline_parallel_size": 1,
   "max_num_seqs": 256,
-  "max_model_len": 4096,
-  "gpu_memory_utilization": 0.9,
+  "max_model_len": 8192,
+  "gpu_memory_utilization": 0.85,
   "kv_connector": "NixlConnector",
   "kv_role": "consumer",
   "kv_rank": 0,
@@ -350,7 +548,7 @@ Create `decode_config.json`:
   "nixl_transport": "rdma",
   "nixl_port": 50052,
   "nixl_proxy_host": "prefill-node-ip:50051",
-  "kv_buffer_size": "10GB",
+  "kv_buffer_size": "15GB",
   "kv_cache_backend": "s3",
   "s3_endpoint_url": "${S3_ENDPOINT_URL}",
   "s3_bucket_name": "${S3_BUCKET_NAME}",
@@ -358,14 +556,21 @@ Create `decode_config.json`:
 }
 ```
 
-### 4.2 Launch Decode Instance
+**Configuration Notes for Gaudi3:**
+- `max_num_seqs: 256`: Moderate batch size for decode workload
+- `max_model_len: 8192`: Match prefill context length
+- `gpu_memory_utilization: 0.85`: Conservative for 128GB Gaudi3
+- `kv_buffer_size: 15GB`: Sufficient for decode throughput
+
+### 4.2 Launch Decode Instance (Gaudi3)
 
 ```bash
-# Start decode node
+# Start decode node on Gaudi3
 docker run -d \
-  --name vllm-decode \
+  --name vllm-decode-gaudi3 \
   --runtime=habana \
   -e HABANA_VISIBLE_DEVICES=all \
+  -e PT_HPU_LAZY_MODE=1 \
   -e OMPI_MCA_btl_vader_single_copy_mechanism=none \
   --cap-add=sys_nice \
   --net=host \
@@ -375,13 +580,13 @@ docker run -d \
   -e S3_ENDPOINT_URL=${S3_ENDPOINT_URL} \
   -e S3_BUCKET_NAME=${S3_BUCKET_NAME} \
   -v $(pwd)/decode_config.json:/workspace/config.json \
-  vllm-disagg:latest \
+  vllm-decode-gaudi3:latest \
   python -m vllm.entrypoints.openai.api_server \
-    --model meta-llama/Llama-3-70b-hf \
+    --model meta-llama/Llama-3.1-70b \
     --tensor-parallel-size 4 \
     --max-num-seqs 256 \
-    --max-model-len 4096 \
-    --gpu-memory-utilization 0.9 \
+    --max-model-len 8192 \
+    --gpu-memory-utilization 0.85 \
     --kv-connector NixlConnector \
     --kv-role consumer \
     --kv-rank 0 \
@@ -389,9 +594,16 @@ docker run -d \
     --nixl-transport rdma \
     --nixl-port 50052 \
     --nixl-proxy-host prefill-node-ip:50051 \
-    --kv-buffer-size 10GB \
-    --port 8001
+    --kv-buffer-size 15GB \
+    --port 8001 \
+    --trust-remote-code
 ```
+
+**Gaudi3-Specific Flags:**
+- `--runtime=habana`: Habana container runtime
+- `PT_HPU_LAZY_MODE=1`: Enable lazy mode for better performance
+- `HABANA_VISIBLE_DEVICES=all`: Expose all Gaudi3 accelerators
+- `OMPI_MCA_btl_vader_single_copy_mechanism=none`: Optimize MPI for Gaudi
 
 ## Step 5: Configure LMCache with S3 Backend
 
@@ -1255,26 +1467,99 @@ Based on Mooncake's production experience:
 
 ### Small-Scale Deployment (1 Prefill + 1 Decode)
 
-- **Prefill Node**: 4x GPUs/HPUs, 100GB RAM, 1TB SSD
-- **Decode Node**: 4x GPUs/HPUs, 100GB RAM, 1TB SSD
-- **Network**: 100Gbps RDMA
-- **Storage**: Ceph S3 with 10TB capacity
+**Prefill Node (AMD MI300X):**
+- 1x MI300X (192GB HBM3, 8 GCDs)
+- Host: 256GB DDR5 RAM, 2TB NVMe SSD
+- ROCm 6.0+
+- 1x 100Gbps RDMA NIC
 
-### Medium-Scale Deployment (4 Prefill + 4 Decode)
+**Decode Node (Intel Gaudi3):**
+- 4x Gaudi3 (128GB HBM2e each, total 512GB)
+- Host: 128GB DDR5 RAM, 1TB NVMe SSD
+- SynapseAI 1.18+
+- 1x 100Gbps RDMA NIC
 
-- **Prefill Nodes**: 4 nodes with 8x GPUs/HPUs each
-- **Decode Nodes**: 4 nodes with 8x GPUs/HPUs each
-- **Network**: 200Gbps RDMA
-- **Storage**: Ceph S3 with 50TB capacity
-- **Load Balancer**: NGINX or HAProxy
+**Shared Infrastructure:**
+- Network: 100Gbps RDMA (InfiniBand or RoCE)
+- Storage: Ceph S3 or NFS/RDMA with 10TB capacity
+- Use case: Development, small production workloads
 
-### Large-Scale Deployment (16+ Prefill + 16+ Decode)
+**Performance Expectations:**
+- Prefill throughput: 50K-100K tokens/sec (MI300X)
+- Decode throughput: 10K-15K tokens/sec (4x Gaudi3)
+- TTFT: <500ms with cache, 1-3s without cache
 
-- **Prefill Cluster**: 16+ nodes with distributed scheduling
-- **Decode Cluster**: 16+ nodes with auto-scaling
-- **Network**: 400Gbps InfiniBand
-- **Storage**: Ceph S3 with 200TB+ capacity
-- **Orchestration**: Kubernetes with custom operators
+### Medium-Scale Deployment (4 Prefill + 8 Decode)
+
+**Prefill Cluster (AMD MI300X):**
+- 4 nodes, each with 2x MI300X (384GB HBM3 per node)
+- Total prefill capacity: 8x MI300X
+- Host per node: 512GB RAM, 4TB NVMe SSD
+- 2x 200Gbps RDMA NICs per node
+
+**Decode Cluster (Intel Gaudi3):**
+- 8 nodes, each with 4x Gaudi3 (512GB HBM2e per node)
+- Total decode capacity: 32x Gaudi3
+- Host per node: 256GB RAM, 2TB NVMe SSD
+- 2x 200Gbps RDMA NICs per node
+
+**Shared Infrastructure:**
+- Network: 200Gbps RDMA fabric
+- Storage: Ceph NFS/RDMA or Mooncake with 50-100TB capacity
+- Load Balancer: NGINX or HAProxy
+- Orchestration: Kubernetes recommended
+
+**Cost Optimization:**
+- Ratio: 1 MI300X prefill : 4 Gaudi3 decode (balanced for most workloads)
+- MI300X handles memory-intensive prefill
+- Gaudi3 provides cost-effective decode scaling
+
+**Performance Expectations:**
+- Aggregate prefill: 400K-800K tokens/sec
+- Aggregate decode: 80K-120K tokens/sec
+- Concurrent users: 1K-5K
+- Cache hit rate target: >60%
+
+### Large-Scale Deployment (16+ Prefill + 32+ Decode)
+
+**Prefill Cluster (AMD MI300X):**
+- 16+ nodes, each with 4x MI300X (768GB HBM3 per node)
+- Total prefill capacity: 64+ MI300X
+- Host per node: 1TB RAM, 8TB NVMe SSD
+- 4x 400Gbps InfiniBand NICs per node
+
+**Decode Cluster (Intel Gaudi3):**
+- 32+ nodes, each with 8x Gaudi3 (1TB HBM2e per node)
+- Total decode capacity: 256+ Gaudi3
+- Host per node: 512GB RAM, 4TB NVMe SSD
+- 2x 400Gbps InfiniBand NICs per node
+
+**Shared Infrastructure:**
+- Network: 400Gbps InfiniBand fabric with RDMA
+- Storage: Mooncake or NFS/RDMA cluster with 200TB-1PB capacity
+- Distributed cache pool: Aggregate underutilized DRAM/SSD
+- Load Balancer: Multiple NGINX instances with DNS round-robin
+- Orchestration: Kubernetes with custom KV-cache-aware scheduling
+- Monitoring: Prometheus + Grafana for metrics
+
+**Advanced Features:**
+- Topology-aware routing (Mooncake-style)
+- KVCache-centric scheduling
+- Distributed memory pooling
+- Auto-scaling based on request load
+
+**Performance Expectations:**
+- Aggregate prefill: 3M-6M tokens/sec
+- Aggregate decode: 500K-1M tokens/sec
+- Concurrent users: 50K-100K+
+- Cache hit rate target: 70-90% (with proper tuning)
+- SLO: 95th percentile TTFT <1s
+
+**Cost Analysis (Approximate):**
+- MI300X nodes: Higher capex, justified by prefill throughput
+- Gaudi3 nodes: Lower opex for decode workload
+- Overall TCO: 30-40% lower than homogeneous premium GPU setup
+- Power efficiency: Gaudi3's lower TDP reduces power costs for decode
 
 ## vLLM Cache Lifecycle Policies
 
