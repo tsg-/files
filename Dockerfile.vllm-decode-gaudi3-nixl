@@ -1,0 +1,220 @@
+# SPDX-License-Identifier: Apache-2.0
+# syntax=docker/dockerfile:1.4
+
+# Dockerfile.vllm-decode-gaudi3-nixl
+# vLLM Decode Node for Intel Gaudi3 with NIXL, UCX-Gaudi, and LMCache
+# Starts from nixlbench base image
+#
+# Build: docker build --target nixlbench -f Dockerfile.nixlbench -t nixlbench .
+#        docker build -f Dockerfile.vllm-decode-gaudi3-nixl -t vllm-decode-gaudi3-nixl:latest .
+
+FROM nixlbench AS vllm-decode-gaudi3-nixl
+
+ARG DEFAULT_PYTHON_VERSION="3.12"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TOPDIR=/workspace
+
+# Gaudi-specific environment
+ENV HABANA_VISIBLE_DEVICES=all
+ENV PT_HPU_LAZY_MODE=1
+
+# =============================================================================
+# Rebuild UCX-Gaudi with Gaudi support (nixlbench has UCX without ROCm/Gaudi)
+# =============================================================================
+WORKDIR /workspace
+RUN if [ -d /workspace/ucx-gaudi ]; then \
+      cd /workspace/ucx-gaudi && \
+      make clean || true && \
+      ./autogen.sh && \
+      ./contrib/configure-release \
+        --prefix=$PREFIX \
+        --without-rocm \
+        --with-gaudi=/usr \
+        --with-verbs \
+        --with-rdmacm \
+        --enable-mt \
+        --disable-logging \
+        --disable-debug \
+        --disable-assertions \
+        --disable-params-check && \
+      make -j$(nproc) && make install && ldconfig; \
+    else \
+      echo "Warning: ucx-gaudi source not found, using existing UCX build"; \
+    fi
+
+# =============================================================================
+# Rebuild NIXL to link against UCX with Gaudi support
+# =============================================================================
+WORKDIR /workspace/nixl
+RUN rm -rf builddir && \
+    uv run --active meson setup \
+      --wipe \
+      --prefix=$PREFIX \
+      --buildtype=release \
+      -Ddisable_gds_backend=true \
+      -Dlibfabric_path=$PREFIX \
+      -Ducx_path=$PREFIX \
+      builddir .
+
+RUN cd builddir && \
+    ninja && \
+    ninja install && \
+    ldconfig && \
+    cd .. && rm -rf builddir
+
+# Rebuild nixlbench
+WORKDIR /workspace/nixl/benchmark/nixlbench/
+RUN rm -rf builddir && \
+    uv run --active meson setup \
+      --wipe \
+      --prefix=$PREFIX \
+      -Dnixl_path=$PREFIX \
+      -Dcudapath_inc='' \
+      -Dcudapath_lib='' \
+      -Dcudapath_stub='' \
+      builddir .
+
+RUN cd builddir && \
+    ninja && \
+    ninja install && \
+    ldconfig
+
+# =============================================================================
+# Build vLLM with Gaudi support
+# =============================================================================
+WORKDIR ${TOPDIR}
+
+# Clone vLLM-Gaudi to get stable commit reference
+RUN git clone --progress -v https://github.com/vllm-project/vllm-gaudi ${TOPDIR}/vllm-gaudi
+
+# Clone base vLLM
+RUN git clone --progress -v https://github.com/vllm-project/vllm ${TOPDIR}/vllm
+WORKDIR ${TOPDIR}/vllm
+
+# Checkout stable commit for vLLM-Gaudi compatibility
+RUN export VLLM_COMMIT_HASH=$(cd ${TOPDIR}/vllm-gaudi && git show "origin/vllm/last-good-commit-for-vllm-gaudi:VLLM_STABLE_COMMIT" 2>/dev/null || echo "v0.10.0") \
+    && git checkout $VLLM_COMMIT_HASH || git checkout v0.10.0
+
+# Install build requirements (excluding torch to reuse Habana's torch)
+RUN grep -v '^torch' requirements/build.txt > /tmp/build_requirements.txt && \
+    pip install -r /tmp/build_requirements.txt && \
+    rm /tmp/build_requirements.txt
+
+# Build vLLM with empty device as base
+ENV VLLM_TARGET_DEVICE=empty
+RUN pip install --no-build-isolation -e .
+
+# Build vLLM-Gaudi extension
+WORKDIR ${TOPDIR}/vllm-gaudi
+RUN pip install -e .
+
+# =============================================================================
+# Install LMCache
+# =============================================================================
+WORKDIR ${TOPDIR}
+
+RUN pip install boto3 botocore pandas msgspec pyzmq
+
+RUN ( \
+    git clone --progress -b wip-nixl-obj https://github.com/mmgaggle/LMCache.git ${TOPDIR}/LMCache && \
+    cd ${TOPDIR}/LMCache && \
+    pip install -r requirements/build.txt && \
+    \
+    # Patch setup.py to skip CUDA extensions
+    python3 -c "import re; \
+f = open('setup.py', 'r'); content = f.read(); f.close(); \
+content = re.sub(r'cuda_extensions\\s*=\\s*cuda_extension\\([^)]*\\)', 'cuda_extensions = []', content, flags=re.DOTALL); \
+content = re.sub(r'ext_modules\\s*=\\s*cuda_extensions', 'ext_modules = []', content); \
+open('setup.py', 'w').write(content); \
+print('Patched setup.py');" && \
+    \
+    export LMCACHE_SKIP_CUDA_BUILD=1 && \
+    pip install -e . --no-build-isolation \
+) || ( \
+    echo "Source build failed, trying PyPI..." && \
+    pip install lmcache --no-deps \
+) || ( \
+    echo "Warning: LMCache installation failed. Continuing without it." \
+)
+
+# Verify LMCache installation
+RUN python -c "import lmcache; print(f'LMCache: {lmcache.__version__}')" 2>/dev/null || \
+    echo "LMCache not available (will use vLLM prefix caching only)"
+
+# =============================================================================
+# Update benchmark scripts for Gaudi3
+# =============================================================================
+
+# NIXL benchmark script for Gaudi3 (UCX with Gaudi transport)
+COPY <<'NIXLBENCH_GAUDI3' $HOME/.local/bin/nixlbench-gaudi3-ucx.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+export ETCD=${ETCD:-http://127.0.0.1:2379}
+export START=${START:-4096}
+export MAX=${MAX:-67108864}
+export NITER=${NITER:-1000}
+export NTH=${NTH:-4}
+export WARM=${WARM:-100}
+
+# UCX with Gaudi transport
+export UCX_TLS=${UCX_TLS:-rc,gaudi,sm,self}
+export UCX_NET_DEVICES=${UCX_NET_DEVICES:-mlx5_0:1}
+export UCX_IB_GPU_DIRECT_RDMA=yes
+export UCX_MEMTYPE_CACHE=n
+export UCX_RC_TM_ENABLE=y
+export UCX_LOG_LEVEL=error
+export NIXL_LOG_LEVEL=${NIXL_LOG_LEVEL:-WARN}
+
+exec "$HOME/.local/bin/nixlbench" \
+  --etcd-endpoints "$ETCD" \
+  --backend UCX \
+  --initiator_seg_type DRAM --target_seg_type DRAM \
+  --scheme pairwise --mode SG --op_type WRITE \
+  --start_block_size "$START" --max_block_size "$MAX" \
+  --num_iter "$NITER" --warmup_iter "$WARM" \
+  --num_threads "$NTH"
+NIXLBENCH_GAUDI3
+
+RUN chmod +x $HOME/.local/bin/nixlbench-gaudi3-ucx.sh
+
+# =============================================================================
+# Entrypoint and Health Check
+# =============================================================================
+
+COPY <<'ENTRYPOINT' /entrypoint-gaudi3-nixl.sh
+#!/bin/bash
+set -e
+
+echo "=== vLLM Decode Node (Intel Gaudi3) with NIXL ==="
+echo "Habana Runtime: $(hl-smi --version 2>/dev/null || echo 'unknown')"
+echo "Visible Devices: ${HABANA_VISIBLE_DEVICES:-all}"
+
+# Verify Gaudi devices
+hl-smi -L 2>/dev/null || echo "Warning: hl-smi not available"
+
+# Verify UCX transports
+echo "UCX Transports:"
+ucx_info -d | grep -E "(Transport|Device)" | head -20 || echo "Warning: ucx_info not available"
+
+# Verify libraries
+echo "Checking libraries..."
+ldconfig
+ldd $(which python) | grep -E "(libfabric|ucx)" || echo "Warning: libfabric/ucx not linked"
+
+# Verify NIXL
+nixlbench --help 2>&1 | head -5 || echo "Warning: nixlbench not available"
+
+exec "$@"
+ENTRYPOINT
+
+RUN chmod +x /entrypoint-gaudi3-nixl.sh
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8001/health || exit 1
+
+WORKDIR /workspace
+
+ENTRYPOINT ["/entrypoint-gaudi3-nixl.sh"]
+CMD ["python", "-m", "vllm.entrypoints.openai.api_server", "--help"]

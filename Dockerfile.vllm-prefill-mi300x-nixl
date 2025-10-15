@@ -1,0 +1,259 @@
+# SPDX-License-Identifier: Apache-2.0
+# syntax=docker/dockerfile:1.4
+
+# Dockerfile.vllm-prefill-mi300x-nixl
+# vLLM Prefill Node for AMD MI300X with NIXL, UCX-Gaudi, and LMCache
+# Starts from nixlbench base image
+#
+# Build: docker build --target nixlbench -f Dockerfile.nixlbench -t nixlbench .
+#        docker build -f Dockerfile.vllm-prefill-mi300x-nixl -t vllm-prefill-mi300x-nixl:latest .
+
+FROM nixlbench AS vllm-prefill-mi300x-nixl
+
+ARG DEFAULT_PYTHON_VERSION="3.12"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TOPDIR=/workspace
+ENV ROCM_HOME=/opt/rocm
+ENV PATH=$PREFIX/bin:$ROCM_HOME/bin:$PATH
+ENV LD_LIBRARY_PATH=$PREFIX/lib:$ROCM_HOME/lib:$LD_LIBRARY_PATH
+
+# =============================================================================
+# Install ROCm development packages for MI300X
+# =============================================================================
+ARG UBUNTU_CODENAME=noble
+ARG ROCM_VER=6.0
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl gpg lsb-release && \
+    rm -rf /var/lib/apt/lists/*
+
+# Add AMD ROCm repository
+RUN set -eux; \
+    mkdir -p /etc/apt/keyrings; \
+    curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor >/etc/apt/keyrings/rocm.gpg; \
+    printf "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/%s %s main\n" "$ROCM_VER" "$UBUNTU_CODENAME" >/etc/apt/sources.list.d/rocm.list; \
+    printf "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/amdgpu/%s/ubuntu %s main\n" "$ROCM_VER" "$UBUNTU_CODENAME" >>/etc/apt/sources.list.d/amdgpu.list; \
+    printf "Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n" >/etc/apt/preferences.d/rocm-pin-600; \
+    apt-get update
+
+# Install ROCm packages
+RUN apt-get install -y --no-install-recommends \
+      rocm-hip-sdk \
+      rocm-hip-runtime \
+      rocm-ml-libraries \
+      rocm-dev \
+      rocm-libs \
+      rocm-smi-lib \
+      hip-dev \
+      hipify-clang && \
+    rm -rf /var/lib/apt/lists/*
+
+# Set MI300X environment
+ENV HCC_AMDGPU_TARGET=gfx942
+ENV HSA_FORCE_FINE_GRAIN_PCIE=1
+ENV HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+# =============================================================================
+# Rebuild UCX-Gaudi with ROCm support (nixlbench has UCX without ROCm/Gaudi)
+# =============================================================================
+WORKDIR /workspace
+RUN if [ -d /workspace/ucx-gaudi ]; then \
+      cd /workspace/ucx-gaudi && \
+      make clean || true && \
+      ./autogen.sh && \
+      ./contrib/configure-release \
+        --prefix=$PREFIX \
+        --with-rocm=/opt/rocm \
+        --without-gaudi \
+        --with-verbs \
+        --with-rdmacm \
+        --enable-mt \
+        --disable-logging \
+        --disable-debug \
+        --disable-assertions \
+        --disable-params-check && \
+      make -j$(nproc) && make install && ldconfig; \
+    else \
+      echo "Warning: ucx-gaudi source not found, using existing UCX build"; \
+    fi
+
+# =============================================================================
+# Rebuild NIXL to link against UCX with ROCm support
+# =============================================================================
+WORKDIR /workspace/nixl
+RUN rm -rf builddir && \
+    uv run --active meson setup \
+      --wipe \
+      --prefix=$PREFIX \
+      --buildtype=release \
+      -Ddisable_gds_backend=true \
+      -Dlibfabric_path=$PREFIX \
+      -Ducx_path=$PREFIX \
+      builddir .
+
+RUN cd builddir && \
+    ninja && \
+    ninja install && \
+    ldconfig && \
+    cd .. && rm -rf builddir
+
+# Rebuild nixlbench
+WORKDIR /workspace/nixl/benchmark/nixlbench/
+RUN rm -rf builddir && \
+    uv run --active meson setup \
+      --wipe \
+      --prefix=$PREFIX \
+      -Dnixl_path=$PREFIX \
+      -Dcudapath_inc='' \
+      -Dcudapath_lib='' \
+      -Dcudapath_stub='' \
+      builddir .
+
+RUN cd builddir && \
+    ninja && \
+    ninja install && \
+    ldconfig
+
+# =============================================================================
+# Install PyTorch with ROCm support
+# =============================================================================
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/rocm6.0
+
+# =============================================================================
+# Build vLLM with ROCm
+# =============================================================================
+WORKDIR ${TOPDIR}
+
+# Clone vLLM
+RUN git clone -v https://github.com/vllm-project/vllm ${TOPDIR}/vllm
+WORKDIR ${TOPDIR}/vllm
+
+# Checkout stable commit (v0.10.0 or as needed)
+RUN git checkout v0.10.0 || git checkout main
+
+# Install build requirements (excluding torch)
+RUN set -eux; \
+    sed '/^torch/d' requirements/build.txt > /tmp/req-no-torch.txt; \
+    pip install --no-cache-dir -r /tmp/req-no-torch.txt; \
+    rm -f /tmp/req-no-torch.txt
+
+# Build vLLM with ROCm
+ENV VLLM_TARGET_DEVICE=rocm
+RUN pip install --no-build-isolation -e .
+
+# =============================================================================
+# Install LMCache with ROCm support
+# =============================================================================
+WORKDIR ${TOPDIR}
+
+RUN pip install boto3 botocore pandas msgspec pyzmq
+
+RUN ( \
+    git clone --depth=1 -b wip-nixl-obj https://github.com/mmgaggle/LMCache.git ${TOPDIR}/LMCache && \
+    cd ${TOPDIR}/LMCache && \
+    pip install -r requirements/build.txt && \
+    \
+    # Try building with ROCm/HIP support
+    export ROCM_HOME="${ROCM_HOME}" && \
+    export HCC_AMDGPU_TARGET="${HCC_AMDGPU_TARGET}" && \
+    pip install -e . --no-build-isolation \
+) || ( \
+    # Fallback: patch to skip GPU extensions
+    echo "HIP build failed; patching setup.py to skip extensions..." && \
+    cd ${TOPDIR}/LMCache && \
+    python3 -c "import re; \
+f = open('setup.py', 'r'); content = f.read(); f.close(); \
+content = re.sub(r'cuda_extensions\\s*=\\s*cuda_extension\\([^)]*\\)', 'cuda_extensions = []', content, flags=re.DOTALL); \
+content = re.sub(r'ext_modules\\s*=\\s*cuda_extensions', 'ext_modules = []', content); \
+open('setup.py', 'w').write(content); \
+print('Patched setup.py');" && \
+    export LMCACHE_SKIP_CUDA_BUILD=1 && \
+    pip install -e . --no-build-isolation \
+) || ( \
+    echo "Warning: LMCache installation failed. Continuing without it." \
+)
+
+# Verify LMCache installation
+RUN python -c "import lmcache; print(f'LMCache: {lmcache.__version__}')" 2>/dev/null || \
+    echo "LMCache not available (will use vLLM prefix caching only)"
+
+# =============================================================================
+# Update benchmark scripts for MI300X
+# =============================================================================
+
+# NIXL benchmark script for MI300X (UCX with ROCm)
+COPY <<'NIXLBENCH_MI300X' $HOME/.local/bin/nixlbench-mi300x-ucx.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+export ETCD=${ETCD:-http://127.0.0.1:2379}
+export START=${START:-4096}
+export MAX=${MAX:-67108864}
+export NITER=${NITER:-1000}
+export NTH=${NTH:-4}
+export WARM=${WARM:-100}
+
+# UCX with ROCm transport
+export UCX_TLS=${UCX_TLS:-rc,rocm,sm,self}
+export UCX_NET_DEVICES=${UCX_NET_DEVICES:-mlx5_0:1}
+export UCX_IB_GPU_DIRECT_RDMA=yes
+export UCX_MEMTYPE_CACHE=n
+export UCX_RC_TM_ENABLE=y
+export UCX_LOG_LEVEL=error
+export NIXL_LOG_LEVEL=${NIXL_LOG_LEVEL:-WARN}
+
+exec "$HOME/.local/bin/nixlbench" \
+  --etcd-endpoints "$ETCD" \
+  --backend UCX \
+  --initiator_seg_type DRAM --target_seg_type DRAM \
+  --scheme pairwise --mode SG --op_type WRITE \
+  --start_block_size "$START" --max_block_size "$MAX" \
+  --num_iter "$NITER" --warmup_iter "$WARM" \
+  --num_threads "$NTH"
+NIXLBENCH_MI300X
+
+RUN chmod +x $HOME/.local/bin/nixlbench-mi300x-ucx.sh
+
+# =============================================================================
+# Entrypoint and Health Check
+# =============================================================================
+
+COPY <<'ENTRYPOINT' /entrypoint-mi300x-nixl.sh
+#!/bin/bash
+set -e
+
+echo "=== vLLM Prefill Node (AMD MI300X) with NIXL ==="
+echo "ROCm Version: $(cat /opt/rocm/.info/version 2>/dev/null || echo 'unknown')"
+echo "Visible GPUs: ${HIP_VISIBLE_DEVICES:-all}"
+
+# Verify ROCm
+rocm-smi --showproductname 2>/dev/null || echo "Warning: rocm-smi not available"
+
+# Verify UCX transports
+echo "UCX Transports:"
+ucx_info -d | grep -E "(Transport|Device)" | head -20 || echo "Warning: ucx_info not available"
+
+# Verify libraries
+echo "Checking libraries..."
+ldconfig
+ldd $(which python) | grep -E "(libfabric|ucx)" || echo "Warning: libfabric/ucx not linked"
+
+# Verify NIXL
+nixlbench --help 2>&1 | head -5 || echo "Warning: nixlbench not available"
+
+exec "$@"
+ENTRYPOINT
+
+RUN chmod +x /entrypoint-mi300x-nixl.sh
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Remove SSH server if present
+RUN apt-get purge -y openssh-server || true
+
+WORKDIR /workspace
+
+ENTRYPOINT ["/entrypoint-mi300x-nixl.sh"]
+CMD ["python", "-m", "vllm.entrypoints.openai.api_server", "--help"]
