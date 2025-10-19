@@ -1,0 +1,338 @@
+diff --git a/lmcache/integration/vllm/vllm_v1_adapter.py b/lmcache/integration/vllm/vllm_v1_adapter_hpu.py
+index 0000000..1111111 100644
+--- a/lmcache/integration/vllm/vllm_v1_adapter.py
++++ b/lmcache/integration/vllm/vllm_v1_adapter_hpu.py
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: Apache-2.0
++# HPU adaptation for Intel Gaudi3
+ # Standard
+ from dataclasses import dataclass, field
+ from typing import TYPE_CHECKING, Any, Generator, Optional, Union
+@@ -19,6 +20,11 @@ from vllm.utils import cdiv, get_kv_cache_torch_dtype
+ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.version import __version__ as VLLM_VERSION
+ import torch
++
++# HPU-specific imports for Gaudi3
++try:
++    import habana_frameworks.torch.core as htcore
++except ImportError:
++    htcore = None
+ 
+ # First Party
+ from lmcache import utils
+@@ -445,7 +451,16 @@ def _init_lmcache_engine(
+ 
+     # Change current device.
+-    num_gpus = torch.cuda.device_count()
+-    local_rank = parallel_config.rank % num_gpus
+-    torch.cuda.set_device(local_rank)
+-    device = torch.device(f"cuda:{local_rank}")
++    # Detect device type: CUDA or HPU
++    if torch.cuda.is_available():
++        num_devices = torch.cuda.device_count()
++        local_rank = parallel_config.rank % num_devices
++        torch.cuda.set_device(local_rank)
++        device = torch.device(f"cuda:{local_rank}")
++        device_type = "cuda"
++    elif torch.hpu.is_available() and htcore is not None:
++        num_devices = torch.hpu.device_count()
++        local_rank = parallel_config.rank % num_devices
++        torch.hpu.set_device(local_rank)
++        device = torch.device(f"hpu:{local_rank}")
++        device_type = "hpu"
++    else:
++        raise RuntimeError("Neither CUDA nor HPU devices available")
++
+     metadata = LMCacheEngineMetadata(
+         model_config.model,
+         parallel_config.world_size,
+@@ -590,6 +605,12 @@ class LMCacheConnectorV1Impl:
+         logger.info(
+             f"LMCache initialized for role {role} with version {utils.get_version()}, "
+             f"vllm version {VLLM_VERSION}, "
++            f"device type: {device_type}, "
+             "lmcache cache_engine metadata: "
+             f"{getattr(self.lmcache_engine, 'metadata', None)}"
+         )
++        
++        # Store device type for later use
++        self.device_type = device_type if hasattr(self, 'lmcache_engine') else None
++        if self.device_type == "hpu" and htcore is None:
++            logger.warning("HPU device detected but habana_frameworks not available")
+ 
+     def get_inference_info(self) -> dict:
+@@ -687,7 +708,14 @@ class LMCacheConnectorV1Impl:
+ 
+             # TODO: have a pre-allocated buffer to hold the slot_mappings
+-            slot_mapping = request.slot_mapping.cuda()
++            # Move to appropriate device (CUDA or HPU)
++            if self.device_type == "hpu":
++                slot_mapping = request.slot_mapping.to('hpu', non_blocking=True)
++            elif self.device_type == "cuda":
++                slot_mapping = request.slot_mapping.cuda()
++            else:
++                # Fallback: try to infer from engine device
++                slot_mapping = request.slot_mapping.to(
++                    self.lmcache_engine.gpu_connector.device, non_blocking=True)
+             assert len(tokens) == len(slot_mapping)
+ 
+             self._stats_monitor.update_interval_vllm_hit_tokens(
+@@ -751,6 +779,10 @@ class LMCacheConnectorV1Impl:
+         if self.layerwise_retrievers:
+             logger.debug(f"Waiting for layer {self.current_layer} to be loaded")
+ 
++        # HPU synchronization
++        if self.device_type == "hpu" and htcore is not None:
++            htcore.mark_step()
++
+         # Wait for the layer to be loaded
+         for layerwise_retriever in self.layerwise_retrievers:
+             ret_token_mask = next(layerwise_retriever)
+@@ -813,7 +845,13 @@ class LMCacheConnectorV1Impl:
+                 # TODO: have a pre-allocated buffer to hold the slot_mappings
+-                slot_mapping = slot_mapping.cuda()
++                # Move to appropriate device
++                if self.device_type == "hpu":
++                    slot_mapping = slot_mapping.to('hpu', non_blocking=True)
++                elif self.device_type == "cuda":
++                    slot_mapping = slot_mapping.cuda()
++                else:
++                    slot_mapping = slot_mapping.to(
++                        self.lmcache_engine.gpu_connector.device, non_blocking=True)
+ 
+                 if self.kv_role == "kv_producer":
+                     skip_leading_tokens = 0
+@@ -868,6 +906,10 @@ class LMCacheConnectorV1Impl:
+ 
+     @_lmcache_nvtx_annotate
+     def wait_for_save(self):
+         """Blocking until the KV cache is saved to the connector buffer."""
++        
++        # HPU synchronization before checking save status
++        if self.device_type == "hpu" and htcore is not None:
++            htcore.mark_step()
+ 
+         connector_metadata = self._parent._get_connector_metadata()
+         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
+@@ -896,7 +938,13 @@ class LMCacheConnectorV1Impl:
+             assert len(slot_mapping) == len(token_ids)
+ 
+             # TODO: have a pre-allocated buffer to hold the slot_mappings
+-            slot_mapping = slot_mapping.cuda()
++            # Move to appropriate device
++            if self.device_type == "hpu":
++                slot_mapping = slot_mapping.to('hpu', non_blocking=True)
++            elif self.device_type == "cuda":
++                slot_mapping = slot_mapping.cuda()
++            else:
++                slot_mapping = slot_mapping.to(
++                    self.lmcache_engine.gpu_connector.device, non_blocking=True)
+ 
+             skip_leading_tokens = save_spec.skip_leading_tokens
+             if self.kv_role == "kv_producer":
+@@ -949,6 +997,10 @@ class LMCacheConnectorV1Impl:
+                 request.disagg_spec.num_transferred_tokens = len(token_ids)
+ 
++        # Final HPU synchronization after all saves complete
++        if self.device_type == "hpu" and htcore is not None:
++            htcore.mark_step()
++
+     @_lmcache_nvtx_annotate
+     def get_finished(
+         self, finished_req_ids: set[str]
+diff --git a/lmcache/v1/gpu_connector/__init__.py b/lmcache/v1/gpu_connector/__init__.py
+index 2222222..3333333 100644
+--- a/lmcache/v1/gpu_connector/__init__.py
++++ b/lmcache/v1/gpu_connector/__init__.py
+@@ -1,6 +1,14 @@
+ # GPU connector base class
+ import torch
+ 
++# Import HPU support if available
++try:
++    import habana_frameworks.torch.core as htcore
++    HPU_AVAILABLE = True
++except ImportError:
++    htcore = None
++    HPU_AVAILABLE = False
++
+ class VLLMPagedMemGPUConnectorV2:
+     """
+     GPU connector for vLLM paged memory management.
+@@ -19,7 +27,14 @@ class VLLMPagedMemGPUConnectorV2:
+         self.use_mla = use_mla
+         
+         # Determine if we should use GPU intermediate buffers
+-        self.use_gpu_buffer = use_gpu and torch.cuda.is_available()
++        if use_gpu:
++            if torch.cuda.is_available():
++                self.use_gpu_buffer = True
++                self.device_type = "cuda"
++            elif HPU_AVAILABLE and torch.hpu.is_available():
++                self.use_gpu_buffer = True
++                self.device_type = "hpu"
++            else:
++                self.use_gpu_buffer = False
++                self.device_type = "cpu"
++        else:
++            self.use_gpu_buffer = False
++            self.device_type = "cpu"
+         
+         # Store device for tensor operations
+         self.device = device
+@@ -42,7 +57,17 @@ class VLLMPagedMemGPUConnectorV2:
+         Synchronize device operations.
+         """
+-        if self.use_gpu_buffer:
+-            torch.cuda.synchronize(self.device)
++        if not self.use_gpu_buffer:
++            return
++            
++        if self.device_type == "cuda":
++            torch.cuda.synchronize(self.device)
++        elif self.device_type == "hpu" and htcore is not None:
++            htcore.mark_step()
++            # Optional: explicit synchronization
++            # htcore.hpu.synchronize()
++        else:
++            # CPU or unknown device type
++            pass
+ 
+     def copy_to_device(self, cpu_tensor: torch.Tensor) -> torch.Tensor:
+         """
+@@ -51,7 +76,13 @@ class VLLMPagedMemGPUConnectorV2:
+         if not self.use_gpu_buffer:
+             return cpu_tensor
+         
+-        return cpu_tensor.cuda(self.device, non_blocking=True)
++        if self.device_type == "cuda":
++            return cpu_tensor.cuda(self.device, non_blocking=True)
++        elif self.device_type == "hpu":
++            return cpu_tensor.to(self.device, non_blocking=True)
++        else:
++            return cpu_tensor.to(self.device)
+ 
+     def copy_from_device(self, device_tensor: torch.Tensor) -> torch.Tensor:
+         """
+diff --git a/lmcache/v1/gpu_connector/vllm_connector.py b/lmcache/v1/gpu_connector/vllm_connector.py
+index 4444444..5555555 100644
+--- a/lmcache/v1/gpu_connector/vllm_connector.py
++++ b/lmcache/v1/gpu_connector/vllm_connector.py
+@@ -3,6 +3,13 @@
+ import torch
+ from typing import Optional, List
+ 
++# Import HPU support
++try:
++    import habana_frameworks.torch.core as htcore
++    HPU_AVAILABLE = True
++except ImportError:
++    htcore = None
++    HPU_AVAILABLE = False
++
+ class VLLMBufferLayerwiseGPUConnector:
+     """
+     Layerwise GPU connector for blending operations.
+@@ -23,6 +30,20 @@ class VLLMBufferLayerwiseGPUConnector:
+         self.dtype = dtype
+         self.device = device
+         
++        # Detect device type
++        if device.type == "cuda":
++            self.device_type = "cuda"
++        elif device.type == "hpu":
++            if not HPU_AVAILABLE:
++                raise RuntimeError("HPU device specified but habana_frameworks not available")
++            self.device_type = "hpu"
++        elif device.type == "cpu":
++            self.device_type = "cpu"
++        else:
++            # Try to infer from availability
++            self.device_type = "cuda" if torch.cuda.is_available() else \
++                              "hpu" if HPU_AVAILABLE and torch.hpu.is_available() else \
++                              "cpu"
++        
+         # Pre-allocate buffers if using GPU
+         if use_gpu:
+             self._allocate_buffers()
+@@ -44,8 +65,15 @@ class VLLMBufferLayerwiseGPUConnector:
+         """
+         Synchronize device operations.
+         """
+-        if self.use_gpu:
+-            torch.cuda.synchronize(self.device)
++        if not self.use_gpu:
++            return
++            
++        if self.device_type == "cuda":
++            torch.cuda.synchronize(self.device)
++        elif self.device_type == "hpu" and htcore is not None:
++            htcore.mark_step()
++        else:
++            pass
+ 
+ class VLLMPagedMemLayerwiseGPUConnector:
+     """
+@@ -67,6 +95,17 @@ class VLLMPagedMemLayerwiseGPUConnector:
+         self.dtype = dtype
+         self.device = device
+         
++        # Detect device type (same as VLLMBufferLayerwiseGPUConnector)
++        if device.type == "cuda":
++            self.device_type = "cuda"
++        elif device.type == "hpu":
++            if not HPU_AVAILABLE:
++                raise RuntimeError("HPU device specified but habana_frameworks not available")
++            self.device_type = "hpu"
++        else:
++            self.device_type = "cuda" if torch.cuda.is_available() else \
++                              "hpu" if HPU_AVAILABLE and torch.hpu.is_available() else \
++                              "cpu"
++        
+     def synchronize(self):
+         """
+         Synchronize device operations.
+         """
+-        if self.use_gpu:
+-            torch.cuda.synchronize(self.device)
++        if not self.use_gpu:
++            return
++            
++        if self.device_type == "cuda":
++            torch.cuda.synchronize(self.device)
++        elif self.device_type == "hpu" and htcore is not None:
++            htcore.mark_step()
++        else:
++            pass
+diff --git a/lmcache/utils.py b/lmcache/utils.py
+index 6666666..7777777 100644
+--- a/lmcache/utils.py
++++ b/lmcache/utils.py
+@@ -1,5 +1,12 @@
+ import torch
+ 
++# Import HPU support for device detection
++try:
++    import habana_frameworks.torch.core as htcore
++    HPU_AVAILABLE = True
++except ImportError:
++    htcore = None
++    HPU_AVAILABLE = False
++
+ def get_device_type() -> str:
+     """
+     Detect and return the available device type.
+@@ -8,7 +15,11 @@ def get_device_type() -> str:
+         str: "cuda", "hpu", or "cpu"
+     """
+     if torch.cuda.is_available():
+         return "cuda"
++    elif HPU_AVAILABLE and torch.hpu.is_available():
++        return "hpu"
+     else:
+         return "cpu"
++
++def is_hpu_available() -> bool:
++    """Check if HPU (Habana) is available."""
++    return HPU_AVAILABLE and torch.hpu.is_available()

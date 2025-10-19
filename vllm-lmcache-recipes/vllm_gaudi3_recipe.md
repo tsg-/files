@@ -782,6 +782,85 @@ def create_kv_connector(vllm_config, role):
     # ... other connector types
 ```
 
+### Advanced Configuration via Sampling Parameters
+
+The vLLM v1 adapter supports passing LMCache configurations per-request through `SamplingParams`:
+
+```python
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    device="hpu",
+    kv_connector="lmcache",
+)
+
+# Request-specific configuration via extra_args
+sampling_params = SamplingParams(
+    temperature=0.7,
+    max_tokens=100,
+    extra_args={
+        "kv_transfer_params": {
+            # Skip saving cache for this low-priority request
+            "lmcache.skip_save": True,
+            
+            # Custom cache tags for organization
+            "lmcache.tags": ["user:alice", "session:123"],
+            
+            # Disaggregated prefill parameters
+            "disagg_spec": {
+                "req_id": "request-abc-123",
+                "receiver_host": "10.0.1.100",
+                "receiver_init_port": 5555,
+                "receiver_alloc_port": 5556,
+            }
+        }
+    }
+)
+
+outputs = llm.generate(["Your prompt here"], sampling_params)
+```
+
+### Priority-Based Cache Management
+
+LMCache supports skipping cache saves for low-priority requests to optimize storage:
+
+```python
+# In LMCache configuration file (lmcache_config.yaml)
+priority_limit: 5  # Only cache requests with priority <= 5
+
+# Usage with priority
+class PrioritizedRequest:
+    def __init__(self, prompt: str, priority: int):
+        self.prompt = prompt
+        self.priority = priority  # Lower = higher priority
+
+# High-priority requests (will be cached)
+high_priority_req = PrioritizedRequest("Important query", priority=1)
+
+# Low-priority requests (cache save skipped)
+low_priority_req = PrioritizedRequest("Casual query", priority=10)
+```
+
+### Environment Variables for HPU Adaptation
+
+```bash
+# Force skip all cache saves (testing/debugging)
+export LMCACHE_FORCE_SKIP_SAVE=1
+
+# Enable verbose logging for LMCache operations
+export LOG_LEVEL_ALL=3
+
+# HPU-specific optimizations
+export PT_HPU_LAZY_MODE=1
+export HABANA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+# For disaggregated architecture
+export HCCL_OVER_TCP=1  # Enable TCP for HCCL collectives
+export MASTER_ADDR=192.168.1.100
+export MASTER_PORT=29500
+```
+
 ### Testing LMCache on Gaudi3
 
 Once ported, test with:
@@ -816,6 +895,83 @@ outputs2 = llm.generate([prompt], SamplingParams(max_tokens=100))
 print(f"Second request (cache hit): {outputs2[0].metrics.time_to_first_token_s:.2f}s")
 
 # Expected speedup: 10-50x depending on context size
+```
+
+### Additional HPU-Specific Considerations
+
+#### Memory Management
+
+The adapter uses several memory-related operations that need HPU equivalents:
+
+```python
+# Original CUDA code (from vllm_v1_adapter.py)
+slot_mapping = request.slot_mapping.cuda()
+
+# HPU equivalent needed
+slot_mapping = request.slot_mapping.to('hpu')
+
+# CUDA synchronization
+torch.cuda.synchronize()
+
+# HPU equivalent
+htcore.mark_step()
+```
+
+#### Multimodal Feature Hashing
+
+The adapter supports multimodal inputs (images, audio) with hash-based token replacement:
+
+```python
+# From vllm_v1_adapter.py - extract_mm_features() and apply_mm_hashes_to_token_ids()
+# This functionality needs to work on HPU tensors
+
+# Example: Image tokens get replaced with content hashes for cache key generation
+token_ids = torch.tensor([1, 2, 3, 32000, 32001, 4, 5])  # 32000-32001 are image tokens
+mm_hashes = ["hash_abc123", "hash_def456"]  # Hashes of actual image content
+mm_positions = [PlaceholderRange(offset=3, length=2)]  # Image tokens at positions 3-4
+
+# After hashing: token_ids used for cache lookup include content-based hashes
+# This ensures different images generate different cache keys
+```
+
+#### Chunk Size and Block Alignment
+
+Critical configuration from the adapter:
+
+```python
+# From vllm_v1_adapter.py
+def ReqMeta.from_request_tracker(..., lmcache_chunk_size=256, discard_partial_chunks=True):
+    """
+    lmcache_chunk_size: Granularity of cache storage (default 256 tokens)
+    discard_partial_chunks: Whether to save incomplete chunks during prefill
+    """
+    
+# For Gaudi3, tune chunk size based on context length:
+# - 2K-8K context: chunk_size=256 (default)
+# - 16K-32K context: chunk_size=512
+# - 64K+ context: chunk_size=1024
+```
+
+#### Decode Phase Cache Behavior
+
+Important behavior from adapter:
+
+```python
+# From vllm_v1_adapter.py - ReqMeta.from_request_tracker()
+save_decode_cache = False  # Default: don't save cache during decode phase
+
+# This is because:
+# 1. Decode generates 1 token at a time (low cache efficiency)
+# 2. Storage overhead exceeds performance benefit
+# 3. Most applications only need prefill cache
+
+# Override only for specific use cases:
+llm = LLM(
+    model="...",
+    kv_transfer_config={
+        "save_decode_cache": True,  # Enable if you need decode caching
+    }
+)
 ```
 
 ### NIXL Integration for Gaudi3
@@ -864,6 +1020,163 @@ private:
 };
 ```
 
+### Key Adapter Implementation Details
+
+Based on `vllm_v1_adapter.py`, the following critical features need HPU support:
+
+#### 1. Request State Tracking
+
+```python
+# The adapter maintains detailed request state through RequestTracker
+class RequestTracker:
+    """Tracks each request's progress through prefill and decode phases"""
+    
+    # Key fields that need to work with HPU tensors:
+    - token_ids: list[int]              # Token sequence
+    - allocated_block_ids: list[int]    # vLLM KV cache blocks
+    - num_saved_tokens: int             # Cached token count
+    - mm_hashes: Optional[list[str]]    # Multimodal content hashes
+    - is_decode_phase: bool             # Prefill vs decode tracking
+    
+    # Important for HPU: block_ids format changed in vLLM 0.9.0+
+    # Now list[list[int]] to support multiple KV cache groups
+```
+
+#### 2. Load/Save Specifications
+
+```python
+# LoadSpec: Controls when to load from cache
+@dataclass
+class LoadSpec:
+    vllm_cached_tokens: int      # Already in vLLM's KV cache (prefix caching)
+    lmcache_cached_tokens: int   # Available in LMCache storage
+    can_load: bool               # Scheduler permission to load
+    
+# SaveSpec: Controls when to save to cache  
+@dataclass
+class SaveSpec:
+    skip_leading_tokens: int     # Already saved, don't re-save
+    can_save: bool              # Scheduler permission to save
+    
+# Key optimization: Only save at chunk boundaries (default 256 tokens)
+# Avoids frequent small writes to storage
+```
+
+#### 3. Disaggregated Prefill/Decode Support
+
+```python
+# DisaggSpec: Built-in support for split prefill/decode clusters
+@dataclass
+class DisaggSpec:
+    req_id: str                  # Request identifier
+    receiver_id: str             # Decode cluster node ID
+    receiver_host: str           # IP address of decode node
+    receiver_init_port: int      # Control plane port
+    receiver_alloc_port: int     # Data transfer port
+    is_last_prefill: bool        # Final prefill chunk flag
+    num_transferred_tokens: int  # Tokens already sent to decode cluster
+    
+# Usage: Prefill node saves KV cache, decode node loads it
+# Requires low-latency storage (NFS with NIXL, VAST, etc.)
+```
+
+#### 4. Layer-wise Operations
+
+```python
+# The adapter supports layer-by-layer KV cache transfer for pipelining
+def save_kv_layer(layer_name: str, kv_layer: torch.Tensor, ...):
+    """Save individual layer's KV cache"""
+    # On first layer (layer 0), initialize storage
+    # On subsequent layers, continue writing
+    # Enables prefill/decode overlap
+    
+def wait_for_layer_load(layer_name: str):
+    """Block until specific layer is loaded"""
+    # Allows layer-by-layer pipelining during prefill
+    # Layer N+1 can compute while layer N loads from cache
+```
+
+#### 5. Blending Support
+
+```python
+# For partial cache hits, blend cached and computed KV states
+if self.enable_blending:
+    self.blender.blend(
+        tokens[:lmcache_cached_tokens],
+        token_mask[:lmcache_cached_tokens],
+        kvcaches=kvcaches,
+        slot_mapping=slot_mapping[:lmcache_cached_tokens],
+    )
+    
+# Use case: Cached KV is slightly outdated (e.g., old prompt version)
+# Blender interpolates between cached and freshly computed KV
+```
+
+### HPU-Specific Code Patterns to Replace
+
+#### Pattern 1: Device Placement
+
+```python
+# CUDA code (from vllm_v1_adapter.py line ~390)
+slot_mapping = request.slot_mapping.cuda()
+
+# HPU replacement
+slot_mapping = request.slot_mapping.to('hpu')
+```
+
+#### Pattern 2: Synchronization
+
+```python
+# CUDA code (implicit in operations)
+torch.cuda.synchronize()
+
+# HPU replacement
+import habana_frameworks.torch.core as htcore
+htcore.mark_step()
+```
+
+#### Pattern 3: Device Streams
+
+```python
+# CUDA code
+with torch.cuda.stream(cuda_stream):
+    # operations
+
+# HPU replacement  
+with htcore.hpu.stream(hpu_stream):
+    # operations
+```
+
+#### Pattern 4: Device Info
+
+```python
+# CUDA code
+num_gpus = torch.cuda.device_count()
+local_rank = parallel_config.rank % num_gpus
+torch.cuda.set_device(local_rank)
+device = torch.device(f"cuda:{local_rank}")
+
+# HPU replacement
+num_hpus = torch.hpu.device_count()
+local_rank = parallel_config.rank % num_hpus
+torch.hpu.set_device(local_rank)
+device = torch.device(f"hpu:{local_rank}")
+```
+
+#### Pattern 5: Collective Communications
+
+```python
+# CUDA code (uses NCCL)
+from vllm.distributed.parallel_state import get_tp_group
+tpg = get_tp_group()
+tpg.broadcast(tensor, src=0)
+
+# HPU replacement (uses HCCL)
+# Same API, but ensure HCCL backend is initialized
+export HCCL_OVER_TCP=1  # Enable TCP transport
+# vLLM should automatically use HCCL on HPU devices
+```
+
 ### Expected Performance with LMCache on Gaudi3
 
 Based on VastData benchmarks (adapted for Gaudi3):
@@ -877,6 +1190,143 @@ Based on VastData benchmarks (adapted for Gaudi3):
 | **Total TTFT (cached)** | 180-220s | 3.5-5.0s | **36-63x** |
 
 **Note**: Gaudi3's PCIe Gen5 (128 GB/s) is slower than MI300X's Infinity Fabric, so cache load times are ~2s vs 1.5s.
+
+### Internal API Server and Observability
+
+The vLLM v1 adapter includes a built-in internal API server for monitoring and control:
+
+#### Built-in Monitoring Endpoints
+
+```python
+# From vllm_v1_adapter.py - InternalAPIServer initialization
+# The API server provides runtime introspection
+
+# Start internal API (automatic if enabled in config)
+self.api_server = InternalAPIServer(self)
+self.api_server.start()
+
+# Available endpoints:
+# GET /health - Health check
+# GET /stats - LMCache statistics
+# GET /config - Current configuration  
+# GET /inference_info - vLLM and model details
+# POST /config - Update configuration at runtime
+```
+
+#### Monitoring LMCache Statistics
+
+```python
+# Get LMCache statistics
+import requests
+
+response = requests.get("http://localhost:8888/stats")
+stats = response.json()
+
+print(f"Cache hits: {stats['cache_hits']}")
+print(f"Cache misses: {stats['cache_misses']}")
+print(f"Hit rate: {stats['hit_rate']:.1%}")
+print(f"Tokens cached: {stats['total_cached_tokens']}")
+print(f"Storage used: {stats['storage_used_gb']:.2f} GB")
+```
+
+#### Runtime Configuration Updates
+
+```python
+# Update LMCache config without restart
+config_update = {
+    "lmcache.chunk_size": 512,  # Change chunk size
+    "lmcache.save_decode_cache": True,  # Enable decode caching
+}
+
+response = requests.post(
+    "http://localhost:8888/config",
+    json=config_update
+)
+
+if response.status_code == 200:
+    print("Configuration updated successfully")
+```
+
+#### Observability with LMCStatsMonitor
+
+```python
+# From vllm_v1_adapter.py - Built-in stats monitoring
+self._stats_monitor = LMCStatsMonitor.GetOrCreate()
+
+# Track metrics
+self._stats_monitor.update_interval_vllm_hit_tokens(
+    request.load_spec.vllm_cached_tokens
+)
+
+# Example: Custom monitoring integration
+from lmcache.observability import LMCStatsMonitor
+
+monitor = LMCStatsMonitor.GetOrCreate()
+
+# Get current stats
+stats = monitor.get_stats()
+print(f"Prefill time: {stats.avg_prefill_time_ms:.1f} ms")
+print(f"Cache save time: {stats.avg_save_time_ms:.1f} ms")
+print(f"Cache load time: {stats.avg_load_time_ms:.1f} ms")
+
+# Export to Prometheus
+from prometheus_client import start_http_server, Gauge
+
+cache_hit_rate = Gauge('lmcache_hit_rate', 'LMCache hit rate')
+cache_hit_rate.set(stats.hit_rate)
+
+start_http_server(9090)  # Prometheus scrape endpoint
+```
+
+### Plugin Framework Support
+
+The adapter includes a plugin framework for custom extensions:
+
+```python
+# From vllm_v1_adapter.py - PluginLauncher
+self.plugin_launcher = PluginLauncher(
+    self.config,
+    role,
+    self.worker_count,
+    worker_id
+)
+self.plugin_launcher.launch_plugins()
+
+# Example: Custom cache warmup plugin
+# Create: plugins/cache_warmup_plugin.py
+
+from lmcache.v1.plugin.plugin_base import PluginBase
+
+class CacheWarmupPlugin(PluginBase):
+    """Pre-load popular prompts into cache at startup"""
+    
+    def __init__(self, config, role, worker_count, worker_id):
+        super().__init__(config, role, worker_count, worker_id)
+        self.warmup_prompts = [
+            "Summarize the following document:",
+            "Analyze the following code:",
+            "Translate the following text:",
+        ]
+    
+    def on_startup(self):
+        """Called when LMCache engine starts"""
+        if self.role == "worker" and self.worker_id == 0:
+            print("Warming up cache with common prompts...")
+            for prompt in self.warmup_prompts:
+                # Trigger cache save for these prompts
+                self.engine.prefetch(prompt)
+    
+    def on_request_complete(self, request_id, stats):
+        """Called when a request finishes"""
+        if stats.cache_hit:
+            print(f"Request {request_id}: cache hit!")
+
+# Register plugin in config
+# lmcache_config.yaml:
+# plugins:
+#   - module: plugins.cache_warmup_plugin
+#     class: CacheWarmupPlugin
+```
 
 ---
 
@@ -1097,6 +1547,106 @@ export MASTER_PORT=29500
 ping <other_node_ip>
 iperf3 -s  # On one node
 iperf3 -c <server_ip> -t 10  # On other node
+```
+
+#### 6. "LMCache adapter errors"
+
+**Symptom**: `AttributeError: 'Tensor' object has no attribute 'cuda'`
+
+```bash
+# This indicates CUDA-specific code that needs HPU adaptation
+# Check the error traceback for the specific file and line
+
+# Common fixes:
+# Replace .cuda() with .to('hpu')
+# Replace torch.cuda.synchronize() with htcore.mark_step()
+# Replace torch.cuda.Stream() with htcore.hpu.Stream()
+```
+
+**Symptom**: `Block ID mismatch in request tracker`
+
+```python
+# vLLM 0.9.0+ changed block_ids format from list[int] to list[list[int]]
+# The adapter handles this, but check your vLLM version:
+
+import vllm
+print(f"vLLM version: {vllm.__version__}")
+
+# If < 0.9.0, expect list[int]
+# If >= 0.9.0, expect list[list[int]] for multiple KV cache groups
+```
+
+**Symptom**: `Cache hits not detected`
+
+```python
+# Enable debug logging to see cache lookup details
+import logging
+logging.basicConfig(level=logging.DEBUG)
+
+# Check if token IDs are being hashed correctly for multimodal inputs
+# Verify storage backend is accessible
+# Confirm chunk size matches between save and load
+```
+
+#### 7. "Disaggregated prefill/decode connection failures"
+
+```bash
+# Check that receiver ports are open
+sudo netstat -tulpn | grep <receiver_init_port>
+sudo netstat -tulpn | grep <receiver_alloc_port>
+
+# Verify firewall rules
+sudo ufw status
+sudo ufw allow <receiver_init_port>/tcp
+sudo ufw allow <receiver_alloc_port>/tcp
+
+# Test direct connectivity
+nc -zv <receiver_host> <receiver_init_port>
+```
+
+#### 8. "Multimodal cache misses despite same image"
+
+```python
+# Multimodal content is hashed for cache keys
+# Ensure consistent image preprocessing
+
+from vllm import LLM, SamplingParams
+
+# Bad: Different image transforms cause different hashes
+img1 = preprocess(image, resize=512)
+img2 = preprocess(image, resize=1024)  # Different hash!
+
+# Good: Consistent preprocessing
+img1 = preprocess(image, resize=512)
+img2 = preprocess(image, resize=512)  # Same hash, cache hit
+```
+
+#### 9. "Storage backend latency too high"
+
+```python
+# Check storage performance
+from lmcache.v1.storage_backend.connector import StorageBackend
+
+backend = StorageBackend(
+    backend_type="nfs",
+    backend_config={"path": "/mnt/cache"}
+)
+
+# Test write performance
+import time
+import torch
+
+test_data = torch.randn(256, 128, dtype=torch.bfloat16)
+start = time.time()
+backend.put("test_key", test_data)
+backend.wait_all()
+elapsed = time.time() - start
+
+throughput_gbps = (test_data.numel() * 2) / (elapsed * 1024**3)
+print(f"Write throughput: {throughput_gbps:.2f} GB/s")
+
+# Expected: 15-20 GB/s for NIXL-enabled NFS
+# If < 5 GB/s, check network or storage backend
 ```
 
 ---
