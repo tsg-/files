@@ -126,6 +126,7 @@ WORKDIR /workspace/nixl/benchmark/nixlbench/
 RUN uv run --active meson setup \
     --wipe \
     --prefix=$PREFIX \
+    --buildtype=release \
     -Dnixl_path=$PREFIX \
     -Dcudapath_inc='' \
     -Dcudapath_lib='' \

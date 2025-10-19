@@ -147,7 +147,7 @@ RUN pip install --no-build-isolation -e .
 # =============================================================================
 WORKDIR ${TOPDIR}
 
-RUN pip install boto3 botocore pandas msgspec pyzmq
+RUN pip install boto3 botocore pandas msgspec pyzmq aiofile redis sortedcontainers
 
 RUN ( \
     git clone --depth=1 -b wip-nixl-obj https://github.com/mmgaggle/LMCache.git ${TOPDIR}/LMCache && \
@@ -214,6 +214,43 @@ exec "$HOME/.local/bin/nixlbench" \
 NIXLBENCH_MI300X
 
 RUN chmod +x $HOME/.local/bin/nixlbench-mi300x-ucx.sh
+
+# NIXL benchmark script for object storage testing
+COPY <<'NIXLBENCH_OBJ' $HOME/.local/bin/nixlbench-obj.sh
+#!/usr/bin/env bash
+set -euo pipefail
+export ETCD=${ETCD:-http://127.0.0.1:2379}
+export MAX=${MAX:-67108864}
+export NITER=${NITER:-1}
+export NTH=${NTH:-4}
+export BATCHSZ=${BATCHSZ:-16}
+export BUFFERSZ=${BUFFERSZ:-17179869184}
+export WARM=${WARM:-1}
+export OBJ_BUCKET_NAME=${OBJ_BUCKET_NAME:-nixl-bucket}
+export OBJ_SCHEME=${OBJ_SCHEME:-http}
+export OBJ_REGION=${OBJ_REGION:-us-east-1}
+export OBJ_ACCESS_KEY=${OBJ_ACCESS_KEY:-minioadmin}
+export OBJ_SECRET_KEY=${OBJ_SECRET_KEY:-minioadmin}
+export OBJ_ENDPOINT=${OBJ_ENDPOINT:-http://127.0.0.1:9000}
+export OBJ_VIRTUAL_ADDRESSING=${OBJ_VIRTUAL_ADDRESSING:-0}
+export NIXL_LOG_LEVEL=${NIXL_LOG_LEVEL:-WARN}
+exec "$HOME/.local/bin/nixlbench" \
+  --etcd-endpoints "$ETCD" \
+  --backend OBJ \
+  --obj_bucket_name "$OBJ_BUCKET_NAME" \
+  --obj_scheme "$OBJ_SCHEME" \
+  --obj_region "$OBJ_REGION" \
+  --obj_access_key "$OBJ_ACCESS_KEY" \
+  --obj_secret_key "$OBJ_SECRET_KEY" \
+  --obj_endpoint_override "$OBJ_ENDPOINT" \
+  --obj_use_virtual_addressing "$OBJ_VIRTUAL_ADDRESSING" \
+  --num_iter "$NITER" --warmup_iter "$WARM" \
+  --num_threads "$NTH" \
+  --max_batch_size "$BATCHSZ" \
+  --total_buffer_size "$BUFFERSZ"
+NIXLBENCH_OBJ
+
+RUN chmod +x $HOME/.local/bin/nixlbench-obj.sh
 
 # =============================================================================
 # Entrypoint and Health Check

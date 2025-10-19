@@ -114,7 +114,7 @@ RUN pip install -e .
 # =============================================================================
 WORKDIR ${TOPDIR}
 
-RUN pip install boto3 botocore pandas msgspec pyzmq
+RUN pip install boto3 botocore pandas msgspec pyzmq aiofile redis sortedcontainers
 
 RUN ( \
     git clone --progress -b wip-nixl-obj https://github.com/mmgaggle/LMCache.git ${TOPDIR}/LMCache && \
@@ -141,6 +141,47 @@ print('Patched setup.py');" && \
 # Verify LMCache installation
 RUN python -c "import lmcache; print(f'LMCache: {lmcache.__version__}')" 2>/dev/null || \
     echo "LMCache not available (will use vLLM prefix caching only)"
+
+# Patch LMCache to fix HPU/Gaudi device detection issues
+RUN python3 << 'PATCH_LMCACHE'
+import re
+import os
+
+adapter_file = '/usr/local/lib/python3.12/dist-packages/lmcache/integration/vllm/vllm_v1_adapter.py'
+
+if not os.path.exists(adapter_file):
+    print('⚠ LMCache adapter not found, skipping patches')
+    exit(0)
+
+with open(adapter_file, 'r') as f:
+    content = f.read()
+
+patches_applied = 0
+
+# Patch 1: Fix ZeroDivisionError when num_gpus=0
+pattern1 = r'(\s+)local_rank = parallel_config\.rank % num_gpus'
+replacement1 = r'\1# Fixed for HPU/Gaudi: handle num_gpus=0\n\1local_rank = parallel_config.rank % num_gpus if num_gpus > 0 else parallel_config.rank'
+if re.search(pattern1, content):
+    content = re.sub(pattern1, replacement1, content)
+    patches_applied += 1
+    print('✓ Patch 1: Fixed ZeroDivisionError (num_gpus=0)')
+
+# Patch 2: Fix torch.cuda.set_device() call that doesn't exist in Habana PyTorch
+pattern2 = r'(\s+)torch\.cuda\.set_device\(local_rank\)'
+replacement2 = r'\1# Fixed for HPU/Gaudi: torch.cuda.set_device not available\n\1# HPU device selection is handled by habana_frameworks\n\1pass  # torch.cuda.set_device(local_rank)'
+if re.search(pattern2, content):
+    content = re.sub(pattern2, replacement2, content)
+    patches_applied += 1
+    print('✓ Patch 2: Fixed torch.cuda.set_device() for HPU')
+
+if patches_applied > 0:
+    with open(adapter_file, 'w') as f:
+        f.write(content)
+    print(f'✓ Applied {patches_applied} patch(es) to LMCache for HPU/Gaudi support')
+else:
+    print('⚠ No patches applied (patterns not found or already patched)')
+
+PATCH_LMCACHE
 
 # =============================================================================
 # Update benchmark scripts for Gaudi3
@@ -178,6 +219,43 @@ exec "$HOME/.local/bin/nixlbench" \
 NIXLBENCH_GAUDI3
 
 RUN chmod +x $HOME/.local/bin/nixlbench-gaudi3-ucx.sh
+
+# NIXL benchmark script for object storage testing
+COPY <<'NIXLBENCH_OBJ' $HOME/.local/bin/nixlbench-obj.sh
+#!/usr/bin/env bash
+set -euo pipefail
+export ETCD=${ETCD:-http://127.0.0.1:2379}
+export MAX=${MAX:-67108864}
+export NITER=${NITER:-1}
+export NTH=${NTH:-4}
+export BATCHSZ=${BATCHSZ:-16}
+export BUFFERSZ=${BUFFERSZ:-17179869184}
+export WARM=${WARM:-1}
+export OBJ_BUCKET_NAME=${OBJ_BUCKET_NAME:-nixl-bucket}
+export OBJ_SCHEME=${OBJ_SCHEME:-http}
+export OBJ_REGION=${OBJ_REGION:-us-east-1}
+export OBJ_ACCESS_KEY=${OBJ_ACCESS_KEY:-minioadmin}
+export OBJ_SECRET_KEY=${OBJ_SECRET_KEY:-minioadmin}
+export OBJ_ENDPOINT=${OBJ_ENDPOINT:-http://127.0.0.1:9000}
+export OBJ_VIRTUAL_ADDRESSING=${OBJ_VIRTUAL_ADDRESSING:-0}
+export NIXL_LOG_LEVEL=${NIXL_LOG_LEVEL:-WARN}
+exec "$HOME/.local/bin/nixlbench" \
+  --etcd-endpoints "$ETCD" \
+  --backend OBJ \
+  --obj_bucket_name "$OBJ_BUCKET_NAME" \
+  --obj_scheme "$OBJ_SCHEME" \
+  --obj_region "$OBJ_REGION" \
+  --obj_access_key "$OBJ_ACCESS_KEY" \
+  --obj_secret_key "$OBJ_SECRET_KEY" \
+  --obj_endpoint_override "$OBJ_ENDPOINT" \
+  --obj_use_virtual_addressing "$OBJ_VIRTUAL_ADDRESSING" \
+  --num_iter "$NITER" --warmup_iter "$WARM" \
+  --num_threads "$NTH" \
+  --max_batch_size "$BATCHSZ" \
+  --total_buffer_size "$BUFFERSZ"
+NIXLBENCH_OBJ
+
+RUN chmod +x $HOME/.local/bin/nixlbench-obj.sh
 
 # =============================================================================
 # Entrypoint and Health Check
