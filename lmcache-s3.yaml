@@ -1,0 +1,29 @@
+# LMCache Configuration for S3 (Ceph) Backend with NIXL
+# Documentation: https://docs.lmcache.ai/
+
+# Chunk configuration
+chunk_size: 256  # Number of tokens per chunk
+
+# Local storage backend (GPU/CPU memory)
+local_device: "hpu"  # For Gaudi, use "hpu"; for MI300X, use "cuda"
+
+# Remote storage backend configuration
+remote_url: "s3://s3.cephlab.com/nixl/"
+
+# S3-specific configuration
+s3_config:
+  endpoint_url: "http://s3.cephlab.com"
+  region: "us-east-1"
+  access_key_id: "215QPBKECPTMTQ1MLZYW"
+  secret_access_key: "bvzEjZ4ePrisBSj3NOhB85FstcBOgy1nXeUBPoUc"
+  use_virtual_addressing: false
+
+# NIXL transport configuration for KV cache transfer
+nixl_config:
+  transport: "rdma"  # or "ucx" or "obj"
+  etcd_endpoints: "http://127.0.0.1:2379"
+
+# Cache management
+enable_remote_storage: true
+save_decode_cache: true
+retrieve_decode_cache: true

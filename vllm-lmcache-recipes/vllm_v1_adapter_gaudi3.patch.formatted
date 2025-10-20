@@ -1,3 +1,17 @@
+From 920b325367bd0a594f4983adc8fa80b64d09e7ec Mon Sep 17 00:00:00 2001
+From: Tushar Gohad <tgohad@Tushars-MacBook-Pro.local>
+Date: Sun, 19 Oct 2025 08:57:05 -0700
+Subject: [PATCH] Add Intel Gaudi3 HPU support to vLLM v1 adapter
+
+- Add HPU device detection alongside CUDA
+- Replace .cuda() calls with device-agnostic .to() calls
+- Add htcore.mark_step() synchronization for HPU
+- Maintain backward compatibility with CUDA
+- Graceful fallback when HPU not available
+---
+ lmcache/integration/vllm/vllm_v1_adapter.py | 99 +++++++++++++++++++--
+ 1 file changed, 92 insertions(+), 7 deletions(-)
+
 diff --git a/lmcache/integration/vllm/vllm_v1_adapter.py b/lmcache/integration/vllm/vllm_v1_adapter.py
 index 6301b01..82d06c8 100644
 --- a/lmcache/integration/vllm/vllm_v1_adapter.py
@@ -167,3 +181,6 @@ index 6301b01..82d06c8 100644
      @_lmcache_nvtx_annotate
      def get_finished(
          self, finished_req_ids: set[str]
+-- 
+2.51.0
+

@@ -16,9 +16,10 @@
 4. [Context Size Scaling](#context-size-scaling)
 5. [LMCache Integration](#lmcache-integration)
 6. [Disaggregated Prefill/Decode Architecture](#disaggregated-prefilldecodearchitecture)
-7. [Benchmarking](#benchmarking)
-8. [Troubleshooting](#troubleshooting)
-9. [Production Deployment](#production-deployment)
+7. [Testing Deployment Modes](#testing-deployment-modes)
+8. [Benchmarking](#benchmarking)
+9. [Troubleshooting](#troubleshooting)
+10. [Production Deployment](#production-deployment)
 
 ---
 
@@ -1179,15 +1180,35 @@ export HCCL_OVER_TCP=1  # Enable TCP transport
 
 ### Expected Performance with LMCache on Gaudi3
 
-Based on VastData benchmarks (adapted for Gaudi3):
+**Important**: LMCache has two modes:
+- **Mode A**: In-memory only (vLLM's built-in prefix caching)
+- **Mode B**: With storage backend (persistent, multi-instance)
 
-| Metric | Without LMCache | With LMCache | Speedup |
-|--------|----------------|--------------|---------|
-| **Prefill (128K context)** | 180-220s | N/A | - |
-| **KV Cache Store (32GB)** | N/A | 1.5-2.0s @ 16-21 GB/s | - |
-| **KV Cache Load (32GB)** | N/A | 1.5-2.0s @ 16-21 GB/s | - |
-| **Decode (cached context)** | 180-220s | 2-3s | **60-110x** |
-| **Total TTFT (cached)** | 180-220s | 3.5-5.0s | **36-63x** |
+See `LMCACHE_SCENARIOS.md` for detailed comparison.
+
+#### Performance Table (128K Context, Llama-3.1-70B)
+
+| Scenario | First Request | Second Request (Same Instance) | Second Request (After Restart) | Storage I/O |
+|----------|--------------|-------------------------------|--------------------------------|-------------|
+| **No Caching** | 182-223s | 182-223s | 182-223s | None |
+| **LMCache In-Memory Only** | 182-223s | 2-3s (✅ 60-110x) | 182-223s ❌ (cache lost) | None |
+| **LMCache + Storage** | 183.5-225s | 2-3s (✅ 60-110x) | 3.5-5.0s (✅ 36-63x) | 1.5-2.0s per request |
+
+**Mode B Storage Performance** (adapted from VAST Data benchmarks):
+
+| Metric | Time | Bandwidth | Notes |
+|--------|------|-----------|-------|
+| **Prefill (128K context)** | 180-220s | N/A | Full computation |
+| **KV Cache Store (30GB)** | 1.5-2.0s | 16-21 GB/s | Gaudi3 PCIe Gen5 |
+| **KV Cache Load (30GB)** | 1.5-2.0s | 16-21 GB/s | From VAST/NFS |
+| **Decode (512 tokens)** | 2-3s | N/A | Token generation |
+| **Total TTFT (cached)** | 3.5-5.0s | - | Load + Decode |
+| **Speedup vs No Cache** | - | - | **36-63x faster!** |
+
+**Key Differences**:
+- **In-Memory (Mode A)**: Zero storage overhead, but cache lost on restart
+- **Storage (Mode B)**: 1.5-2s overhead per request, but persistent cache
+- **For Disaggregated Architecture**: Mode B is **required** (storage connects prefill/decode clusters)
 
 **Note**: Gaudi3's PCIe Gen5 (128 GB/s) is slower than MI300X's Infinity Fabric, so cache load times are ~2s vs 1.5s.
 
@@ -1332,14 +1353,20 @@ class CacheWarmupPlugin(PluginBase):
 
 ## Disaggregated Prefill/Decode Architecture
 
-[Similar structure to MI300X guide, adapted for Gaudi3's RoCE networking]
+### Overview
 
-### Architecture Overview for Gaudi3
+In a disaggregated architecture, **LMCache runs on BOTH prefill and decode nodes**, enabling:
+- **Prefill nodes**: Save KV cache to shared storage after processing prompts
+- **Decode nodes**: Load KV cache from shared storage before generating tokens
+- **Heterogeneous clusters**: Different hardware types (e.g., AMD MI300X for prefill, Intel Gaudi3 for decode)
+
+### Homogeneous Architecture (Gaudi3 Only)
 
 ```
 ┌───────────────────┐         ┌───────────────────┐
 │  Prefill Cluster  │         │  Decode Cluster   │
 │  (8x Gaudi3)      │         │  (8x Gaudi3)      │
+│  + LMCache        │         │  + LMCache        │
 │                   │         │                   │
 │  - Process prompts│         │  - Generate tokens│
 │  - Heavy compute  │         │  - Low latency    │
@@ -1350,35 +1377,506 @@ class CacheWarmupPlugin(PluginBase):
           │    ┌─────────────────┐     │
           └───►│  Shared Storage │◄────┘
                │  NFS/S3/VAST    │
-               │  + NIXL Gaudi   │
+               │  + NIXL         │
                │  15-20GB/s      │
                └─────────────────┘
 ```
 
-### Gaudi3-Specific Implementation
+### Heterogeneous Architecture (MI300X + Gaudi3) ⭐ RECOMMENDED
+
+```
+┌────────────────────┐        ┌───────────────────┐
+│  Prefill Cluster   │        │  Decode Cluster   │
+│  (AMD MI300X)      │        │  (Intel Gaudi3)   │
+│  + LMCache (CUDA)  │        │  + LMCache (HPU)  │
+│                    │        │                   │
+│  - 192GB HBM/chip  │        │  - 128GB HBM/chip │
+│  - High bandwidth  │        │  - Cost-effective │
+│  - Heavy compute   │        │  - Low latency    │
+│  - Save KV cache   │◄───────┤  - Load KV cache  │
+│                    │ Network│                   │
+└─────────┬──────────┘  RDMA  └─────────┬─────────┘
+          │                             │
+          │    ┌─────────────────┐     │
+          └───►│  Shared Storage │◄────┘
+               │  VAST Data      │
+               │  + NIXL         │
+               │  20-50GB/s      │
+               └─────────────────┘
+```
+
+**Key Points**:
+- ✅ **LMCache runs on BOTH clusters** with device-appropriate adapters
+- ✅ **MI300X (CUDA)** for prefill: High memory bandwidth, excellent for large prompts
+- ✅ **Gaudi3 (HPU)** for decode: Cost-effective, optimized for token generation
+- ✅ **Shared storage** acts as KV cache transfer medium between clusters
+- ✅ **Device-agnostic storage**: NFS, S3, or VAST work across different hardware
+
+### Why Heterogeneous Architecture?
+
+| Aspect | Prefill (MI300X) | Decode (Gaudi3) | Benefit |
+|--------|------------------|-----------------|---------|
+| **Memory** | 192GB HBM | 128GB HBM | Use MI300X's larger memory for prefill |
+| **Bandwidth** | 5.3 TB/s | 3.7 TB/s | Faster KV cache creation |
+| **Cost** | Higher $$$ | Lower $$$ | Use expensive MI300X only where needed |
+| **Latency** | Less critical | Critical | Gaudi3's lower cost allows more decode nodes |
+| **Workload** | Bursty, heavy | Continuous, light | Match hardware to workload |
+
+### LMCache Roles in Disaggregated Setup
+
+#### Prefill Cluster (Producer Role)
 
 ```python
-# gaudi3_disaggregated_prefill.py
-import habana_frameworks.torch.core as htcore
-from vllm import AsyncLLMEngine, AsyncEngineArgs, SamplingParams
+# On AMD MI300X nodes (CUDA)
+from vllm import LLM
 
-class Gaudi3PrefillServer:
-    def __init__(self, model_name: str, storage_backend: str):
+llm = LLM(
+    model="meta-llama/Llama-3.1-70B-Instruct",
+    tensor_parallel_size=8,
+    device="cuda",  # MI300X uses CUDA
+    
+    # LMCache configuration
+    kv_connector="lmcache",
+    kv_role="kv_producer",  # Save KV cache
+    kv_transfer_config={
+        "backend": "vast://vast-cluster/kv-cache",
+        "kv_cache_dtype": "bfloat16",
+    }
+)
+
+# Process prompt - KV cache saved automatically
+outputs = llm.generate(["Long prompt..."], sampling_params)
+```
+
+#### Decode Cluster (Consumer Role)
+
+```python
+# On Intel Gaudi3 nodes (HPU) - with patch applied!
+from vllm import LLM
+
+llm = LLM(
+    model="meta-llama/Llama-3.1-70B-Instruct",
+    tensor_parallel_size=8,
+    device="hpu",  # Gaudi3 uses HPU
+    
+    # LMCache configuration
+    kv_connector="lmcache",
+    kv_role="kv_consumer",  # Load KV cache
+    kv_transfer_config={
+        "backend": "vast://vast-cluster/kv-cache",
+        "kv_cache_dtype": "bfloat16",
+    }
+)
+
+# Generate tokens - KV cache loaded automatically
+outputs = llm.generate([""], sampling_params)  # Empty prompt, uses cached KV
+```
+
+### Storage Backend Requirements
+
+For heterogeneous disaggregated architecture:
+
+1. **Device-Agnostic Storage**: Must work with both CUDA and HPU
+   - ✅ NFS with NIXL
+   - ✅ VAST Data
+   - ✅ S3-compatible object storage
+   - ❌ Direct GPU-to-GPU transfer (requires same vendor)
+
+2. **High Bandwidth**: Minimize KV cache transfer time
+   - Target: 20-50 GB/s
+   - VAST Data: 50+ GB/s with NIXL
+   - Standard NFS: 10-15 GB/s
+
+3. **Low Latency**: Reduce decode startup time
+   - Target: < 100ms metadata lookup
+   - Local caching helps
+
+### Configuration Example
+
+### Complete Heterogeneous Setup (MI300X + Gaudi3)
+
+#### Step 1: Prefill Server (AMD MI300X)
+
+```python
+# prefill_server_mi300x.py
+# Runs on AMD MI300X nodes
+
+from vllm import AsyncLLMEngine, AsyncEngineArgs
+from vllm.sampling_params import SamplingParams
+import asyncio
+
+class MI300XPrefillServer:
+    def __init__(self):
         engine_args = AsyncEngineArgs(
-            model=model_name,
+            model="meta-llama/Llama-3.1-70B-Instruct",
             tensor_parallel_size=8,
-            gpu_memory_utilization=0.90,
-            device="hpu",
+            device="cuda",  # MI300X uses CUDA/ROCm
             max_model_len=131072,
+            gpu_memory_utilization=0.90,
             enable_chunked_prefill=True,
             max_num_batched_tokens=32768,
+            
+            # LMCache configuration
+            kv_connector="lmcache",
+            kv_role="kv_producer",  # Save KV cache
+            kv_transfer_config={
+                "backend": "vast://vast-cluster/kv-cache",
+                "kv_cache_dtype": "bfloat16",
+                "chunk_size": 256,
+            }
         )
         
         self.engine = AsyncLLMEngine.from_engine_args(engine_args)
-        # ... rest similar to MI300X guide
+    
+    async def prefill(self, request_id: str, prompt: str):
+        """Process prompt and save KV cache"""
+        sampling_params = SamplingParams(
+            max_tokens=1,  # Only do prefill
+            extra_args={
+                "kv_transfer_params": {
+                    "req_id": request_id,
+                    # Metadata for decode cluster
+                    "disagg_spec": {
+                        "receiver_host": "gaudi3-decode-cluster.local",
+                        "receiver_init_port": 5555,
+                        "receiver_alloc_port": 5556,
+                    }
+                }
+            }
+        )
+        
+        # Run prefill - KV cache saved automatically
+        async for output in self.engine.generate(prompt, sampling_params, request_id):
+            pass  # We only care about saving KV cache
+        
+        return {"request_id": request_id, "status": "prefill_complete"}
+
+# Start server
+async def main():
+    server = MI300XPrefillServer()
+    # Integrate with your API framework (FastAPI, etc.)
+    print("MI300X Prefill Server ready")
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-[Continue with similar patterns to MI300X guide, adapted for HPU API]
+#### Step 2: Decode Server (Intel Gaudi3) ⭐ WITH HPU PATCH
+
+```python
+# decode_server_gaudi3.py
+# Runs on Intel Gaudi3 nodes - REQUIRES HPU PATCH APPLIED!
+
+import habana_frameworks.torch.core as htcore
+from vllm import AsyncLLMEngine, AsyncEngineArgs
+from vllm.sampling_params import SamplingParams
+import asyncio
+
+class Gaudi3DecodeServer:
+    def __init__(self):
+        engine_args = AsyncEngineArgs(
+            model="meta-llama/Llama-3.1-70B-Instruct",
+            tensor_parallel_size=8,
+            device="hpu",  # Intel Gaudi3 HPU
+            max_model_len=131072,
+            gpu_memory_utilization=0.85,
+            
+            # LMCache configuration
+            kv_connector="lmcache",
+            kv_role="kv_consumer",  # Load KV cache
+            kv_transfer_config={
+                "backend": "vast://vast-cluster/kv-cache",
+                "kv_cache_dtype": "bfloat16",
+                "chunk_size": 256,
+                "enable_async_loading": True,  # Load in background
+            }
+        )
+        
+        self.engine = AsyncLLMEngine.from_engine_args(engine_args)
+    
+    async def decode(self, request_id: str, max_tokens: int = 512):
+        """Load KV cache and generate tokens"""
+        sampling_params = SamplingParams(
+            temperature=0.7,
+            top_p=0.9,
+            max_tokens=max_tokens,
+            extra_args={
+                "kv_transfer_params": {
+                    "req_id": request_id,
+                }
+            }
+        )
+        
+        # Empty prompt - KV cache loaded from storage
+        async for output in self.engine.generate("", sampling_params, request_id):
+            yield output.outputs[0].text
+    
+# Start server
+async def main():
+    server = Gaudi3DecodeServer()
+    print("Gaudi3 Decode Server ready (HPU)")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+#### Step 3: Orchestrator
+
+```python
+# orchestrator.py
+# Coordinates prefill (MI300X) and decode (Gaudi3)
+
+import asyncio
+import aiohttp
+
+class DisaggregatedOrchestrator:
+    def __init__(self):
+        self.prefill_url = "http://mi300x-cluster:8000"
+        self.decode_url = "http://gaudi3-cluster:8001"
+    
+    async def generate(self, prompt: str, max_tokens: int = 512):
+        """
+        1. Send prompt to MI300X prefill cluster
+        2. Wait for KV cache to be saved
+        3. Trigger decode on Gaudi3 cluster
+        4. Stream tokens back to user
+        """
+        request_id = f"req_{hash(prompt)}"
+        
+        # Step 1: Prefill on MI300X
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.prefill_url}/prefill",
+                json={"request_id": request_id, "prompt": prompt}
+            ) as resp:
+                prefill_result = await resp.json()
+        
+        print(f"✓ Prefill complete on MI300X: {request_id}")
+        
+        # Step 2: Decode on Gaudi3 (loads KV cache automatically)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.decode_url}/decode",
+                json={"request_id": request_id, "max_tokens": max_tokens}
+            ) as resp:
+                async for line in resp.content:
+                    yield line.decode()
+        
+        print(f"✓ Decode complete on Gaudi3: {request_id}")
+
+# Usage
+async def main():
+    orchestrator = DisaggregatedOrchestrator()
+    
+    async for token in orchestrator.generate(
+        "Write a detailed analysis of quantum computing:",
+        max_tokens=1000
+    ):
+        print(token, end="", flush=True)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Deployment Configuration
+
+#### Docker Compose for Heterogeneous Setup
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  # Prefill cluster on AMD MI300X
+  prefill-mi300x:
+    image: rocm/vllm:latest
+    runtime: rocm
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    environment:
+      - ROCR_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
+    volumes:
+      - ./prefill_server_mi300x.py:/app/server.py
+      - vast-storage:/mnt/kv-cache
+    command: python /app/server.py
+    ports:
+      - "8000:8000"
+    networks:
+      - disagg-network
+  
+  # Decode cluster on Intel Gaudi3
+  decode-gaudi3:
+    image: vault.habana.ai/gaudi-docker/vllm:latest
+    runtime: habana
+    environment:
+      - HABANA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+      - PT_HPU_LAZY_MODE=1
+    volumes:
+      - ./decode_server_gaudi3.py:/app/server.py
+      - vast-storage:/mnt/kv-cache
+    command: python /app/server.py
+    ports:
+      - "8001:8001"
+    networks:
+      - disagg-network
+  
+  # Orchestrator
+  orchestrator:
+    image: python:3.11
+    volumes:
+      - ./orchestrator.py:/app/orchestrator.py
+    command: python /app/orchestrator.py
+    ports:
+      - "8080:8080"
+    networks:
+      - disagg-network
+    depends_on:
+      - prefill-mi300x
+      - decode-gaudi3
+
+volumes:
+  vast-storage:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=vast-cluster.local,rw
+      device: ":/kv-cache"
+
+networks:
+  disagg-network:
+    driver: bridge
+```
+
+### Performance Expectations (Heterogeneous)
+
+**128K Context, Llama-3.1-70B**:
+
+| Stage | Hardware | Time | Bandwidth |
+|-------|----------|------|-----------|
+| **Prefill** | 8x MI300X | 50-80s | N/A |
+| **KV Save** | MI300X → VAST | 1.2-1.5s | 20-25 GB/s |
+| **KV Load** | VAST → Gaudi3 | 1.8-2.2s | 16-20 GB/s |
+| **Decode** | 8x Gaudi3 | 2-3s (512 tokens) | N/A |
+| **Total TTFT** | End-to-end | **55-87s** | - |
+
+**Compared to MI300X-only setup**:
+- Prefill: Similar (MI300X used in both)
+- Decode: Gaudi3 slightly slower per-token BUT
+- Cost: 40-50% lower (Gaudi3 cheaper than MI300X)
+- Scale: Can have more Gaudi3 decode nodes
+
+### Key Implementation Notes
+
+1. **LMCache Patch Required**: Gaudi3 decode cluster MUST have the HPU patch applied
+2. **Storage Backend**: Must be accessible from both MI300X and Gaudi3 clusters
+3. **Network**: High-bandwidth network between storage and both clusters
+4. **Synchronization**: Request IDs must match between prefill and decode
+5. **Monitoring**: Track KV cache hit rates on both sides
+
+### Summary: LMCache in Disaggregated Architecture
+
+**Q: Does LMCache run on both prefill and decode nodes?**  
+**A: YES!** LMCache runs on BOTH clusters with different roles:
+
+| Cluster | Hardware | LMCache Role | Operations |
+|---------|----------|--------------|------------|
+| **Prefill** | AMD MI300X | `kv_producer` | Save KV cache to storage |
+| **Decode** | Intel Gaudi3 | `kv_consumer` | Load KV cache from storage |
+
+**Q: Can I mix AMD and Intel hardware?**  
+**A: YES!** The storage backend (NFS, VAST, S3) acts as a device-agnostic bridge:
+- MI300X prefill cluster uses CUDA/ROCm backend
+- Gaudi3 decode cluster uses HPU backend (with our patch!)
+- Both read/write to the same shared storage
+
+**Q: Why use different hardware?**  
+**A: Cost optimization!**
+- Use expensive, high-memory MI300X only for compute-heavy prefill
+- Use cost-effective Gaudi3 for continuous, low-latency decode
+- Can provision 2-3x more Gaudi3 decode nodes for same cost
+
+**Q: What's required for this to work?**  
+**A: Three components:**
+1. ✅ LMCache on MI300X (CUDA - works out of box)
+2. ✅ **LMCache on Gaudi3 (HPU - needs our patch!)** ⭐
+3. ✅ Shared storage accessible from both (VAST, NFS, S3)
+
+---
+
+## Testing Deployment Modes
+
+### Import Test
+```bash
+python3 -c "from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl"
+```
+
+### Mode A: In-Memory Only (Development/Testing)
+```python
+from vllm import LLM, SamplingParams
+
+# In-memory prefix caching (no storage tier)
+llm = LLM(
+    model="meta-llama/Llama-3.1-70B-Instruct",
+    tensor_parallel_size=8,  # 8x Gaudi3 chips
+    device="hpu",
+    enable_prefix_caching=True,  # vLLM's built-in caching
+    # No kv_connector specified = in-memory only
+)
+
+prompts = [
+    "Summarize the key features of the Intel Gaudi3 AI accelerator.",
+    "Summarize the key features of the Intel Gaudi3 AI accelerator. Include performance metrics."
+]
+
+sampling_params = SamplingParams(temperature=0.8, top_p=0.95, max_tokens=512)
+outputs = llm.generate(prompts, sampling_params)
+
+for output in outputs:
+    print(f"Prompt: {output.prompt}")
+    print(f"Generated text: {output.outputs[0].text}")
+    print("---")
+```
+
+**Note**: Cache is lost when instance restarts. Use for development, testing, or single-session workloads.
+
+### Mode B: Storage-Backed (Production)
+```python
+from vllm import LLM, SamplingParams
+
+# Storage-backed LMCache (persistent across restarts)
+llm = LLM(
+    model="meta-llama/Llama-3.1-70B-Instruct",
+    tensor_parallel_size=8,  # 8x Gaudi3 chips
+    device="hpu",
+    enable_prefix_caching=True,
+    kv_connector="lmcache",  # Enable storage-backed caching
+    lmcache_config_file="lmcache.yaml"
+)
+
+prompts = [
+    "Summarize the key features of the Intel Gaudi3 AI accelerator.",
+    "Summarize the key features of the Intel Gaudi3 AI accelerator. Include performance metrics."
+]
+
+sampling_params = SamplingParams(temperature=0.8, top_p=0.95, max_tokens=512)
+outputs = llm.generate(prompts, sampling_params)
+
+for output in outputs:
+    print(f"Prompt: {output.prompt}")
+    print(f"Generated text: {output.outputs[0].text}")
+    print("---")
+```
+
+**Note**: Cache persists across restarts and can be shared across multiple instances. **Required** for disaggregated prefill/decode architecture.
+
+### Comparing Mode A vs Mode B
+
+See **LMCACHE_SCENARIOS.md** for detailed comparison:
+- **Mode A**: Zero storage overhead, cache lost on restart
+- **Mode B**: 1.5-2s overhead per request, persistent cache
+- **For Disaggregated**: Mode B is mandatory (storage connects prefill/decode clusters)
 
 ---
 

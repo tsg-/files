@@ -2,51 +2,91 @@
 # syntax=docker/dockerfile:1.4
 
 # Dockerfile.vllm-prefill-mi300x-nixl
-# vLLM Prefill Node for AMD MI300X with NIXL, UCX-Gaudi, and LMCache
-# Starts from nixlbench base image
+# vLLM Prefill Node for AMD MI300X with NIXL, UCX, and LMCache
+# Built from ROCm base (not Habana Gaudi)
 #
-# Build: docker build --target nixlbench -f Dockerfile.nixlbench -t nixlbench .
-#        docker build -f Dockerfile.vllm-prefill-mi300x-nixl -t vllm-prefill-mi300x-nixl:latest .
+# Build: docker build -f Dockerfile.vllm-prefill-mi300x-nixl -t vllm-prefill-mi300x-nixl:latest .
 
-FROM nixlbench AS vllm-prefill-mi300x-nixl
+FROM rocm/dev-ubuntu-24.04:6.2 AS vllm-prefill-mi300x-nixl
 
+# ——————————————————————————————————————————————————
+# Pre‐declare all ENVs so later `ENV foo=$foo…` works without linter errors
+ENV LD_LIBRARY_PATH="" \
+    PKG_CONFIG_PATH="" \
+    CMAKE_PREFIX_PATH="" \
+    CPLUS_INCLUDE_PATH="" \
+    C_INCLUDE_PATH="" \
+    LDFLAGS=""
+# ——————————————————————————————————————————————————
+
+ARG ARCH="x86_64"
 ARG DEFAULT_PYTHON_VERSION="3.12"
+ARG LIBFABRIC_REF="v1.22.x"
+ARG UCX_REF="v1.19.x"
+ARG ROCM_VER=6.2
+ARG UBUNTU_CODENAME=noble
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV HOME=/root
+ENV PREFIX=$HOME/.local
 ENV TOPDIR=/workspace
+
+# ROCm is typically installed at /opt/rocm (symlink to /opt/rocm-x.y.z)
+# Use realpath to resolve symlinks and avoid build issues
 ENV ROCM_HOME=/opt/rocm
+ENV ROCM_PATH=/opt/rocm
 ENV PATH=$PREFIX/bin:$ROCM_HOME/bin:$PATH
-ENV LD_LIBRARY_PATH=$PREFIX/lib:$ROCM_HOME/lib:$LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH=$PREFIX/lib:$PREFIX/lib64:$PREFIX/lib/ucx:$PREFIX/lib/x86_64-linux-gnu:$ROCM_HOME/lib:$LD_LIBRARY_PATH
 
 # =============================================================================
-# Install ROCm development packages for MI300X
+# Verify ROCm installation
 # =============================================================================
-ARG UBUNTU_CODENAME=noble
-ARG ROCM_VER=6.0
+RUN if [ ! -d /opt/rocm ]; then \
+      echo "ERROR: ROCm not found at /opt/rocm"; \
+      exit 1; \
+    fi && \
+    echo "ROCm found at: /opt/rocm" && \
+    ls -la /opt/rocm && \
+    if [ -L /opt/rocm ]; then \
+      echo "ROCm is a symlink to: $(readlink -f /opt/rocm)"; \
+    fi
 
+# =============================================================================
+# Install base dependencies (from nixlbase, minus Gaudi-specific)
+# =============================================================================
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl gpg lsb-release && \
+    build-essential git cmake ninja-build \
+    autotools-dev automake libtool wget curl pkg-config \
+    pybind11-dev libclang-dev libgflags-dev \
+    libgrpc-dev libgrpc++-dev libprotobuf-dev \
+    libaio-dev liburing-dev protobuf-compiler-grpc \
+    libcpprest-dev etcd-client etcd-server \
+    libz-dev flex libgtest-dev libcurl4-openssl-dev \
+    libssl-dev uuid-dev zlib1g-dev libboost-all-dev \
+    libibverbs-dev rdma-core ibverbs-utils libibumad-dev \
+    librdmacm-dev ibverbs-providers meson \
+    python${DEFAULT_PYTHON_VERSION} python3-pip \
+    ca-certificates gpg lsb-release unzip && \
     rm -rf /var/lib/apt/lists/*
 
-# Add AMD ROCm repository
-RUN set -eux; \
-    mkdir -p /etc/apt/keyrings; \
-    curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor >/etc/apt/keyrings/rocm.gpg; \
-    printf "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/%s %s main\n" "$ROCM_VER" "$UBUNTU_CODENAME" >/etc/apt/sources.list.d/rocm.list; \
-    printf "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/amdgpu/%s/ubuntu %s main\n" "$ROCM_VER" "$UBUNTU_CODENAME" >>/etc/apt/sources.list.d/amdgpu.list; \
-    printf "Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n" >/etc/apt/preferences.d/rocm-pin-600; \
-    apt-get update
+# Install AWS CLI
+RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip && \
+    unzip -q /tmp/awscliv2.zip -d /tmp && \
+    /tmp/aws/install && \
+    rm -rf /tmp/awscliv2.zip /tmp/aws
 
-# Install ROCm packages
-RUN apt-get install -y --no-install-recommends \
-      rocm-hip-sdk \
-      rocm-hip-runtime \
-      rocm-ml-libraries \
-      rocm-dev \
-      rocm-libs \
-      rocm-smi-lib \
-      hip-dev \
-      hipify-clang && \
+# =============================================================================
+# Install additional ROCm development packages for MI300X
+# =============================================================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    rocm-hip-sdk \
+    rocm-hip-runtime \
+    rocm-ml-libraries \
+    rocm-dev \
+    rocm-libs \
+    rocm-smi-lib \
+    hip-dev \
+    hipify-clang && \
     rm -rf /var/lib/apt/lists/*
 
 # Set MI300X environment
@@ -55,42 +95,134 @@ ENV HSA_FORCE_FINE_GRAIN_PCIE=1
 ENV HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 # =============================================================================
-# Rebuild UCX-Gaudi with ROCm support (nixlbench has UCX without ROCm/Gaudi)
+# Build libfabric (without Gaudi support, with verbs)
 # =============================================================================
 WORKDIR /workspace
-RUN if [ -d /workspace/ucx-gaudi ]; then \
-      cd /workspace/ucx-gaudi && \
-      make clean || true && \
-      ./autogen.sh && \
-      ./contrib/configure-release \
-        --prefix=$PREFIX \
-        --with-rocm=/opt/rocm \
-        --without-gaudi \
-        --with-verbs \
-        --with-rdmacm \
-        --enable-mt \
-        --disable-logging \
-        --disable-debug \
-        --disable-assertions \
-        --disable-params-check && \
-      make -j$(nproc) && make install && ldconfig; \
+RUN if ls libfabric-*.tar.gz 1> /dev/null 2>&1; then \
+      echo "Using vendored libfabric tarball"; \
+      tar xf libfabric-*.tar.gz && \
+      mv libfabric-*/ libfabric/; \
     else \
-      echo "Warning: ucx-gaudi source not found, using existing UCX build"; \
-    fi
+      echo "libfabric tarball not found. Cloning ${LIBFABRIC_REF}"; \
+      git clone -v https://github.com/ofiwg/libfabric.git; \
+      cd libfabric && git checkout ${LIBFABRIC_REF}; \
+    fi && \
+    cd /workspace/libfabric && \
+    ./autogen.sh && \
+    ./configure --prefix=$PREFIX --enable-verbs --enable-shm --enable-sockets --enable-tcp --with-rocr=/opt/rocm && \
+    make -j$(nproc) && make install && ldconfig
 
 # =============================================================================
-# Rebuild NIXL to link against UCX with ROCm support
+# Build UCX with ROCm support
 # =============================================================================
-WORKDIR /workspace/nixl
-RUN rm -rf builddir && \
-    uv run --active meson setup \
-      --wipe \
+WORKDIR /workspace
+RUN git clone -v https://github.com/openucx/ucx.git && \
+    cd ucx && git checkout ${UCX_REF} && \
+    ./autogen.sh && \
+    ./configure \
       --prefix=$PREFIX \
-      --buildtype=release \
-      -Ddisable_gds_backend=true \
-      -Dlibfabric_path=$PREFIX \
-      -Ducx_path=$PREFIX \
-      builddir .
+      --enable-shared \
+      --disable-static \
+      --disable-doxygen-doc \
+      --enable-optimizations \
+      --enable-cma \
+      --enable-devel-headers \
+      --with-verbs \
+      --with-rdmacm \
+      --with-rocm=/opt/rocm \
+      --enable-mt && \
+    make -j$(nproc) && make install && ldconfig
+
+# =============================================================================
+# Build etcd-cpp-apiv3
+# =============================================================================
+WORKDIR /workspace
+RUN git clone -v https://github.com/etcd-cpp-apiv3/etcd-cpp-apiv3.git && \
+    cd etcd-cpp-apiv3 && mkdir build && cd build && \
+    cmake .. \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=$PREFIX \
+      -DCPPREST_INCLUDE_DIR=/usr/include \
+      -DCPPREST_LIB=/usr/lib/x86_64-linux-gnu/libcpprest.so \
+      -DGRPC_GRPC++_LIBRARY=/usr/lib/x86_64-linux-gnu/libgrpc++.so \
+      -DGRPC_LIBRARY=/usr/lib/x86_64-linux-gnu/libgrpc.so \
+      -DGPR_LIBRARY=/usr/lib/x86_64-linux-gnu/libgpr.so && \
+    make -j$(nproc) && make install && ldconfig
+
+# =============================================================================
+# Build AWS SDK (copied from current directory)
+# =============================================================================
+WORKDIR /workspace
+COPY aws-sdk-cpp/ /workspace/aws-sdk-cpp/
+RUN mkdir -p aws_sdk_build && cd aws_sdk_build && \
+    cmake ../aws-sdk-cpp \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_ONLY="s3" \
+      -DENABLE_TESTING=OFF \
+      -DCMAKE_INSTALL_PREFIX=/usr/local && \
+    make -j$(nproc) && make install && ldconfig
+
+# =============================================================================
+# Install uv and Rust
+# =============================================================================
+WORKDIR /workspace
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH \
+    RUST_VERSION=1.86.0 \
+    RUSTARCH=${ARCH}-unknown-linux-gnu
+
+RUN wget --tries=3 --waitretry=5 \
+      "https://static.rust-lang.org/rustup/archive/1.28.1/${RUSTARCH}/rustup-init" \
+      "https://static.rust-lang.org/rustup/archive/1.28.1/${RUSTARCH}/rustup-init.sha256" && \
+    sha256sum -c rustup-init.sha256 && \
+    chmod +x rustup-init && \
+    ./rustup-init -y --no-modify-path --profile minimal \
+      --default-toolchain $RUST_VERSION --default-host ${RUSTARCH} && \
+    rm rustup-init* && \
+    chmod -R a+w $RUSTUP_HOME $CARGO_HOME
+
+# =============================================================================
+# Build NIXL
+# =============================================================================
+WORKDIR /workspace
+
+# Create necessary directories early
+RUN mkdir -p $PREFIX/{bin,lib,include}
+
+# Clone NIXL
+RUN git clone -v --progress https://github.com/intel-staging/nixl -b obj_dns_fix
+
+# Set up venv for nixl
+ENV VIRTUAL_ENV=/workspace/nixl/.venv
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv venv $VIRTUAL_ENV --python $DEFAULT_PYTHON_VERSION && \
+    uv pip install --upgrade meson pybind11 patchelf msgspec zmq
+
+# Copy requirements if it exists
+RUN if [ -f /workspace/nixl/requirements.txt ]; then \
+      uv pip install -r /workspace/nixl/requirements.txt; \
+    fi
+
+WORKDIR /workspace/nixl
+
+# Set up environment for nixl to find libfabric and etcd-cpp
+ENV PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH \
+    CPLUS_INCLUDE_PATH=$PREFIX/include:$CPLUS_INCLUDE_PATH \
+    C_INCLUDE_PATH=$PREFIX/include:$C_INCLUDE_PATH \
+    LDFLAGS="-L$PREFIX/lib $LDFLAGS"
+
+# Build nixl (disable GDS backend as we're not using CUDA/Gaudi)
+RUN uv run --active meson setup \
+    --wipe \
+    --prefix=$PREFIX \
+    --buildtype=release \
+    -Ddisable_gds_backend=true \
+    -Dlibfabric_path=$PREFIX \
+    -Ducx_path=$PREFIX \
+    builddir .
 
 RUN cd builddir && \
     ninja && \
@@ -98,27 +230,47 @@ RUN cd builddir && \
     ldconfig && \
     cd .. && rm -rf builddir
 
-# Rebuild nixlbench
+# Install python modules
+RUN pip install pandas msgspec pyzmq
+
+# Install NIXL python package
+RUN if [ -f /workspace/nixl/requirements.txt ]; then \
+      pip install -r /workspace/nixl/requirements.txt; \
+    fi
+RUN pip install .
+
+# =============================================================================
+# Build nixlbench
+# =============================================================================
 WORKDIR /workspace/nixl/benchmark/nixlbench/
-RUN rm -rf builddir && \
-    uv run --active meson setup \
-      --wipe \
-      --prefix=$PREFIX \
-      -Dnixl_path=$PREFIX \
-      -Dcudapath_inc='' \
-      -Dcudapath_lib='' \
-      -Dcudapath_stub='' \
-      builddir .
+RUN uv run --active meson setup \
+    --wipe \
+    --prefix=$PREFIX \
+    --buildtype=release \
+    -Dnixl_path=$PREFIX \
+    -Dcudapath_inc='' \
+    -Dcudapath_lib='' \
+    -Dcudapath_stub='' \
+    builddir .
 
 RUN cd builddir && \
     ninja && \
     ninja install && \
     ldconfig
 
+# Verify installation and library paths
+RUN ldconfig && \
+    echo "Library paths configured:" && \
+    echo $LD_LIBRARY_PATH | tr ':' '\n' && \
+    echo "Installed binaries:" && \
+    ls -la $PREFIX/bin/ || true && \
+    echo "Installed libraries:" && \
+    find $PREFIX/lib* -name "*.so*" 2>/dev/null | head -10 || true
+
 # =============================================================================
 # Install PyTorch with ROCm support
 # =============================================================================
-RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/rocm6.0
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/rocm6.2
 
 # =============================================================================
 # Build vLLM with ROCm
@@ -138,9 +290,24 @@ RUN set -eux; \
     pip install --no-cache-dir -r /tmp/req-no-torch.txt; \
     rm -f /tmp/req-no-torch.txt
 
+# Patch setup.py to fix runtime environment detection
+RUN python3 -c "\
+import re; \
+content = open('setup.py', 'r').read(); \
+content = re.sub(r'raise RuntimeError\(\"Unknown runtime environment\"\)', 'return \"0.10.0+rocm\"', content); \
+open('setup.py', 'w').write(content); \
+print('Patched setup.py to bypass runtime environment detection')"
+
 # Build vLLM with ROCm
 ENV VLLM_TARGET_DEVICE=rocm
-RUN pip install --no-build-isolation -e .
+ENV VLLM_BUILD_ENVIRONMENT=local
+ENV VLLM_INSTALL_PUNICA_KERNELS=1
+
+# Set environment variables inline to ensure they're available during build
+RUN export VLLM_TARGET_DEVICE=rocm && \
+    export VLLM_BUILD_ENVIRONMENT=local && \
+    export VLLM_INSTALL_PUNICA_KERNELS=1 && \
+    pip install --no-build-isolation -e .
 
 # =============================================================================
 # Install LMCache with ROCm support
@@ -179,7 +346,7 @@ RUN python -c "import lmcache; print(f'LMCache: {lmcache.__version__}')" 2>/dev/
     echo "LMCache not available (will use vLLM prefix caching only)"
 
 # =============================================================================
-# Update benchmark scripts for MI300X
+# NIXL Benchmark Scripts for MI300X
 # =============================================================================
 
 # NIXL benchmark script for MI300X (UCX with ROCm)
@@ -252,6 +419,43 @@ NIXLBENCH_OBJ
 
 RUN chmod +x $HOME/.local/bin/nixlbench-obj.sh
 
+# UCX localhost benchmarks (from nixlbench)
+COPY <<'UCXTCP' $HOME/.local/bin/nixlbench-local-ucxtcp.sh
+#!/usr/bin/env bash
+set -euo pipefail
+sysctl -w net.core.rmem_max=268435456 2>/dev/null || true
+sysctl -w net.core.wmem_max=268435456 2>/dev/null || true
+sysctl -w net.ipv4.tcp_rmem=4096 131072 268435456 2>/dev/null || true
+sysctl -w net.ipv4.tcp_wmem=4096 131072 268435456 2>/dev/null || true
+sysctl -w net.core.somaxconn=65536 2>/dev/null || true
+sysctl -w net.core.netdev_max_backlog=5000 2>/dev/null || true
+sysctl -w net.ipv4.tcp_max_syn_backlog=8192 2>/dev/null || true
+export ETCD=${ETCD:-http://127.0.0.1:2379}
+export START=${START:-4096}
+export MAX=${MAX:-67108864}
+export NITER=${NITER:-1000}
+export NTH=${NTH:-1}
+export WARM=${WARM:-100}
+export UCX_TLS=${UCX_TLS:-sm,tcp,self}
+export UCX_NET_DEVICES=${UCX_NET_DEVICES:-lo}
+export UCX_SOCKADDR_TLS_PRIORITY=${UCX_SOCKADDR_TLS_PRIORITY:-tcp}
+export UCX_TCP_SNDBUF=${UCX_TCP_SNDBUF:-2097152}
+export UCX_TCP_RCVBUF=${UCX_TCP_RCVBUF:-2097152}
+export UCX_TCP_CM_REUSEADDR=${UCX_TCP_CM_REUSEADDR:-y}
+export UCX_LOG_LEVEL=error
+export NIXL_LOG_LEVEL=${NIXL_LOG_LEVEL:-WARN}
+exec "$HOME/.local/bin/nixlbench" \
+  --etcd-endpoints "$ETCD" \
+  --backend UCX \
+  --initiator_seg_type DRAM --target_seg_type DRAM \
+  --scheme pairwise --mode SG --op_type WRITE \
+  --start_block_size "$START" --max_block_size "$MAX" \
+  --num_iter "$NITER" --warmup_iter "$WARM" \
+  --num_threads "$NTH"
+UCXTCP
+
+RUN chmod +x $HOME/.local/bin/nixlbench-local-ucxtcp.sh
+
 # =============================================================================
 # Entrypoint and Health Check
 # =============================================================================
@@ -286,9 +490,6 @@ RUN chmod +x /entrypoint-mi300x-nixl.sh
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
-
-# Remove SSH server if present
-RUN apt-get purge -y openssh-server || true
 
 WORKDIR /workspace
 

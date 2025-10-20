@@ -19,9 +19,35 @@ This directory contains comprehensive guides and patches for running vLLM with L
 
 ## 📖 Documentation Files
 
-### 1. **vllm_gaudi3_recipe.md** ⭐ START HERE
-**Purpose**: Complete guide for vLLM on Gaudi3  
-**Size**: ~2000 lines  
+### 🚀 Quick Navigation
+
+**New to vLLM on Gaudi3?** → Start with **QUICK_START.md** (15 minutes)  
+**Choosing deployment mode?** → Read **LMCACHE_SCENARIOS.md**  
+**Setting up production?** → Read **vllm_gaudi3_recipe.md**  
+**Disaggregated architecture?** → Read **HETEROGENEOUS_ARCHITECTURE.md**  
+
+---
+
+### 0. **QUICK_START.md** ⚡ START HERE
+**Purpose**: Get running in 15 minutes  
+**Size**: ~400 lines  
+**Audience**: Everyone
+
+**Contents**:
+- Decision tree: Mode A vs Mode B
+- Prerequisites and installation
+- Mode A setup (in-memory caching)
+- Mode B setup (storage-backed)
+- Validation scripts
+- Troubleshooting quick fixes
+
+**Why read this first**: Fastest path to a working deployment.
+
+---
+
+### 1. **vllm_gaudi3_recipe.md** 📚 COMPLETE GUIDE
+**Purpose**: Comprehensive reference  
+**Size**: ~2300 lines  
 **Audience**: All users
 
 **Contents**:
@@ -134,6 +160,59 @@ chmod +x apply_gaudi3_patch.sh
 - Version history
 
 **When to Read**: For a quick overview before diving deep
+
+---
+
+### 6. **LMCACHE_SCENARIOS.md** 🔍 DECISION GUIDE
+**Purpose**: Compare in-memory vs storage-backed LMCache  
+**Size**: ~500 lines  
+**Audience**: Architects, decision-makers
+
+**Contents**:
+- Scenario A: In-memory only (no storage)
+- Scenario B: With storage tier (persistent)
+- Side-by-side comparison tables
+- Performance vs persistence trade-offs
+- Cost-benefit analysis
+- Use case recommendations
+- Real-world examples
+
+**When to Read**: Before choosing deployment architecture
+
+---
+
+### 7. **HETEROGENEOUS_ARCHITECTURE.md** 🔀 ADVANCED
+**Purpose**: Guide for mixed MI300X + Gaudi3 deployments  
+**Size**: ~500 lines  
+**Audience**: Advanced users, architects
+
+**Contents**:
+- Heterogeneous disaggregated architecture
+- MI300X (prefill) + Gaudi3 (decode) setup
+- Cost analysis and optimization
+- Complete deployment examples
+- Data flow and timing diagrams
+- LMCache on both clusters
+- Monitoring and troubleshooting
+
+**When to Read**: Planning production deployment with mixed hardware
+
+---
+
+### 8. **ROCM_CUDA_COMPATIBILITY.md** 🔬 TECHNICAL DEEP-DIVE
+**Purpose**: Explain why LMCache works on MI300X without modification  
+**Size**: ~400 lines  
+**Audience**: Engineers, skeptics, reviewers
+
+**Contents**:
+- PyTorch ROCm CUDA API compatibility
+- Why `torch.cuda.*` works on AMD GPUs
+- Architecture diagrams and API mappings
+- Official PyTorch documentation references
+- Verification procedures
+- FAQ on ROCm/CUDA/HIP
+
+**When to Read**: If you're wondering "Wait, how does CUDA code run on AMD GPUs?"
 
 ---
 
