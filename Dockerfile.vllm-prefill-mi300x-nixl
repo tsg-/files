@@ -316,30 +316,68 @@ WORKDIR ${TOPDIR}
 
 RUN pip install boto3 botocore pandas msgspec pyzmq aiofile redis sortedcontainers
 
-RUN ( \
-    git clone --depth=1 -b wip-nixl-obj https://github.com/mmgaggle/LMCache.git ${TOPDIR}/LMCache && \
-    cd ${TOPDIR}/LMCache && \
-    pip install -r requirements/build.txt && \
-    \
-    # Try building with ROCm/HIP support
-    export ROCM_HOME="${ROCM_HOME}" && \
-    export HCC_AMDGPU_TARGET="${HCC_AMDGPU_TARGET}" && \
-    pip install -e . --no-build-isolation \
-) || ( \
-    # Fallback: patch to skip GPU extensions
-    echo "HIP build failed; patching setup.py to skip extensions..." && \
-    cd ${TOPDIR}/LMCache && \
-    python3 -c "import re; \
-f = open('setup.py', 'r'); content = f.read(); f.close(); \
-content = re.sub(r'cuda_extensions\\s*=\\s*cuda_extension\\([^)]*\\)', 'cuda_extensions = []', content, flags=re.DOTALL); \
-content = re.sub(r'ext_modules\\s*=\\s*cuda_extensions', 'ext_modules = []', content); \
-open('setup.py', 'w').write(content); \
-print('Patched setup.py');" && \
-    export LMCACHE_SKIP_CUDA_BUILD=1 && \
-    pip install -e . --no-build-isolation \
-) || ( \
-    echo "Warning: LMCache installation failed. Continuing without it." \
-)
+# Clone LMCache
+RUN git clone --depth=1 -b wip-nixl-obj https://github.com/mmgaggle/LMCache.git ${TOPDIR}/LMCache
+
+WORKDIR ${TOPDIR}/LMCache
+
+# Install build requirements
+RUN pip install -r requirements/build.txt || true
+
+# Patch setup.py to skip CUDA/HIP extensions for ROCm-only environment
+# This must be done BEFORE pip install attempts to parse setup.py
+RUN python3 << 'PATCH_SETUP'
+import re
+
+print("Reading setup.py...")
+with open('setup.py', 'r') as f:
+    content = f.read()
+
+original = content
+patches = 0
+
+# Patch 1: Replace the entire cuda_extension function to return empty list
+pattern1 = r'def cuda_extension\([^)]*\):.*?(?=\ndef [a-z_]+|class |if __name__|$)'
+if re.search(pattern1, content, re.DOTALL):
+    content = re.sub(pattern1, 'def cuda_extension(*args, **kwargs):\n    """Disabled for non-CUDA environments"""\n    return []\n\n', content, flags=re.DOTALL)
+    patches += 1
+    print('✓ Patch 1: Replaced cuda_extension() function')
+
+# Patch 2: Replace cuda_extensions = cuda_extension(...) calls
+pattern2 = r'cuda_extensions\s*=\s*cuda_extension\([^)]*\)'
+if re.search(pattern2, content):
+    content = re.sub(pattern2, 'cuda_extensions = []  # Disabled for ROCm', content)
+    patches += 1
+    print('✓ Patch 2: Set cuda_extensions = []')
+
+# Patch 3: Replace ext_modules = cuda_extensions
+pattern3 = r'ext_modules\s*=\s*cuda_extensions'
+if re.search(pattern3, content):
+    content = re.sub(pattern3, 'ext_modules = []  # Disabled for ROCm', content)
+    patches += 1
+    print('✓ Patch 3: Set ext_modules = []')
+
+# Patch 4: Remove "Building CUDA extensions" print
+content = re.sub(r'print\(["\']Building CUDA extensions["\']\)', 'print("Skipping CUDA extensions for ROCm")', content)
+
+if patches == 0:
+    print('WARNING: No patches applied! Pattern not found in setup.py')
+    print('First 50 lines of setup.py:')
+    print('\n'.join(content.split('\n')[:50]))
+else:
+    with open('setup.py', 'w') as f:
+        f.write(content)
+    print(f'✓ Successfully applied {patches} patches to setup.py')
+PATCH_SETUP
+
+# Set CUDA_HOME to a dummy path to avoid errors, even though we're not using it
+ENV CUDA_HOME=/opt/rocm
+ENV LMCACHE_SKIP_CUDA_BUILD=1
+
+# Install LMCache without CUDA extensions
+RUN pip install -e . --no-build-isolation --no-deps || \
+    (echo "ERROR: LMCache installation failed after patching. Check setup.py patch." && \
+     echo "Continuing without LMCache..." && true)
 
 # Verify LMCache installation
 RUN python -c "import lmcache; print(f'LMCache: {lmcache.__version__}')" 2>/dev/null || \
