@@ -299,6 +299,60 @@ NIXLBENCH_OBJ
 RUN chmod +x $HOME/.local/bin/nixlbench-obj.sh
 
 # =============================================================================
+# Save Build Version Information
+# =============================================================================
+RUN echo "=== Build Version Information ===" > /app/versions.txt && \
+    echo "BASE_IMAGE: nixlbench (Gaudi base)" >> /app/versions.txt && \
+    echo "PYTHON_VERSION: ${DEFAULT_PYTHON_VERSION}" >> /app/versions.txt && \
+    echo "" >> /app/versions.txt && \
+    echo "=== Dependency Versions (from nixlbench base) ===" >> /app/versions.txt && \
+    (fi_info --version 2>/dev/null | head -1 | sed 's/^/LIBFABRIC_VERSION: /' >> /app/versions.txt || echo "LIBFABRIC_VERSION: unknown" >> /app/versions.txt) && \
+    (ucx_info -v 2>/dev/null | head -1 | sed 's/^/UCX_VERSION: /' >> /app/versions.txt || echo "UCX_VERSION: unknown" >> /app/versions.txt) && \
+    echo "" >> /app/versions.txt && \
+    echo "=== UCX-Gaudi Version ===" >> /app/versions.txt && \
+    (if [ -d /workspace/ucx-gaudi ]; then \
+        cd /workspace/ucx-gaudi && \
+        echo "UCX_GAUDI_REPO: local/ucx-gaudi" >> /app/versions.txt && \
+        echo "UCX_GAUDI_COMMIT: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt; \
+     else \
+        echo "UCX_GAUDI: not rebuilt, using base UCX" >> /app/versions.txt; \
+     fi) && \
+    echo "" >> /app/versions.txt && \
+    echo "=== NIXL Version ===" >> /app/versions.txt && \
+    (cd /workspace/nixl && echo "NIXL_REPO: $(git remote get-url origin 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
+    (cd /workspace/nixl && echo "NIXL_BRANCH: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
+    (cd /workspace/nixl && echo "NIXL_COMMIT: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
+    echo "" >> /app/versions.txt && \
+    echo "=== vLLM Version ===" >> /app/versions.txt && \
+    echo "VLLM_REPO: https://github.com/vllm-project/vllm" >> /app/versions.txt && \
+    (cd /workspace/vllm && echo "VLLM_BRANCH: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
+    (cd /workspace/vllm && echo "VLLM_COMMIT: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
+    echo "VLLM_TARGET_DEVICE: empty (base)" >> /app/versions.txt && \
+    echo "" >> /app/versions.txt && \
+    echo "=== vLLM-Gaudi Version ===" >> /app/versions.txt && \
+    echo "VLLM_GAUDI_REPO: https://github.com/vllm-project/vllm-gaudi" >> /app/versions.txt && \
+    (cd /workspace/vllm-gaudi && echo "VLLM_GAUDI_BRANCH: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
+    (cd /workspace/vllm-gaudi && echo "VLLM_GAUDI_COMMIT: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
+    (cd /workspace/vllm-gaudi && echo "VLLM_STABLE_COMMIT_REF: $(git show 'origin/vllm/last-good-commit-for-vllm-gaudi:VLLM_STABLE_COMMIT' 2>/dev/null || echo 'v0.10.0')" >> /app/versions.txt) && \
+    echo "" >> /app/versions.txt && \
+    echo "=== LMCache Version ===" >> /app/versions.txt && \
+    echo "LMCACHE_REPO: https://github.com/mmgaggle/LMCache.git" >> /app/versions.txt && \
+    echo "LMCACHE_BRANCH: wip-nixl-obj" >> /app/versions.txt && \
+    (cd /workspace/LMCache && echo "LMCACHE_COMMIT: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
+    echo "" >> /app/versions.txt && \
+    echo "=== PyTorch Version ===" >> /app/versions.txt && \
+    (python -c "import torch; print(f'PYTORCH_VERSION: {torch.__version__}')" >> /app/versions.txt 2>/dev/null || echo "PYTORCH_VERSION: unknown" >> /app/versions.txt) && \
+    (python -c "import habana_frameworks.torch as htorch; print('HABANA_PYTORCH: available')" >> /app/versions.txt 2>/dev/null || echo "HABANA_PYTORCH: unknown" >> /app/versions.txt) && \
+    echo "" >> /app/versions.txt && \
+    echo "=== Gaudi Runtime ===" >> /app/versions.txt && \
+    (hl-smi --version 2>/dev/null >> /app/versions.txt || echo "HL-SMI: unknown" >> /app/versions.txt) && \
+    echo "" >> /app/versions.txt && \
+    echo "=== Build Timestamp ===" >> /app/versions.txt && \
+    date -u >> /app/versions.txt && \
+    echo "" >> /app/versions.txt && \
+    cat /app/versions.txt
+
+# =============================================================================
 # Entrypoint and Health Check
 # =============================================================================
 

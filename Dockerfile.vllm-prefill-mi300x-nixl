@@ -495,6 +495,49 @@ UCXTCP
 RUN chmod +x $HOME/.local/bin/nixlbench-local-ucxtcp.sh
 
 # =============================================================================
+# Save Build Version Information
+# =============================================================================
+RUN echo "=== Build Version Information ===" > /app/versions.txt && \
+    echo "BASE_IMAGE: rocm/dev-ubuntu-24.04:6.2" >> /app/versions.txt && \
+    echo "ARCH: ${ARCH}" >> /app/versions.txt && \
+    echo "PYTHON_VERSION: ${DEFAULT_PYTHON_VERSION}" >> /app/versions.txt && \
+    echo "ROCM_VERSION: ${ROCM_VER}" >> /app/versions.txt && \
+    echo "UBUNTU_CODENAME: ${UBUNTU_CODENAME}" >> /app/versions.txt && \
+    echo "" >> /app/versions.txt && \
+    echo "=== Dependency Versions ===" >> /app/versions.txt && \
+    echo "LIBFABRIC_REF: ${LIBFABRIC_REF}" >> /app/versions.txt && \
+    (cd /workspace/libfabric && echo "LIBFABRIC_COMMIT: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
+    echo "UCX_REF: ${UCX_REF}" >> /app/versions.txt && \
+    (cd /workspace/ucx && echo "UCX_COMMIT: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
+    (cd /workspace/etcd-cpp-apiv3 && echo "ETCD_CPP_COMMIT: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
+    echo "RUST_VERSION: ${RUST_VERSION}" >> /app/versions.txt && \
+    echo "" >> /app/versions.txt && \
+    echo "=== NIXL Version ===" >> /app/versions.txt && \
+    echo "NIXL_REPO: https://github.com/intel-staging/nixl" >> /app/versions.txt && \
+    echo "NIXL_BRANCH: obj_dns_fix" >> /app/versions.txt && \
+    (cd /workspace/nixl && echo "NIXL_COMMIT: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
+    echo "" >> /app/versions.txt && \
+    echo "=== vLLM Version ===" >> /app/versions.txt && \
+    echo "VLLM_REPO: https://github.com/vllm-project/vllm" >> /app/versions.txt && \
+    (cd /workspace/vllm && echo "VLLM_BRANCH: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
+    (cd /workspace/vllm && echo "VLLM_COMMIT: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
+    echo "VLLM_TARGET_DEVICE: rocm" >> /app/versions.txt && \
+    echo "" >> /app/versions.txt && \
+    echo "=== LMCache Version ===" >> /app/versions.txt && \
+    echo "LMCACHE_REPO: https://github.com/mmgaggle/LMCache.git" >> /app/versions.txt && \
+    echo "LMCACHE_BRANCH: wip-nixl-obj" >> /app/versions.txt && \
+    (cd /workspace/LMCache && echo "LMCACHE_COMMIT: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
+    echo "" >> /app/versions.txt && \
+    echo "=== PyTorch Version ===" >> /app/versions.txt && \
+    (python -c "import torch; print(f'PYTORCH_VERSION: {torch.__version__}')" >> /app/versions.txt 2>/dev/null || echo "PYTORCH_VERSION: unknown" >> /app/versions.txt) && \
+    (python -c "import torch; print(f'PYTORCH_ROCM_VERSION: {torch.version.hip}')" >> /app/versions.txt 2>/dev/null || echo "PYTORCH_ROCM_VERSION: unknown" >> /app/versions.txt) && \
+    echo "" >> /app/versions.txt && \
+    echo "=== Build Timestamp ===" >> /app/versions.txt && \
+    date -u >> /app/versions.txt && \
+    echo "" >> /app/versions.txt && \
+    cat /app/versions.txt
+
+# =============================================================================
 # Entrypoint and Health Check
 # =============================================================================
 
