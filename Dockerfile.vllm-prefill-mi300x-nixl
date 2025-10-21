@@ -230,14 +230,14 @@ RUN cd builddir && \
     ldconfig && \
     cd .. && rm -rf builddir
 
-# Install python modules
-RUN pip install pandas msgspec pyzmq
+# Install python modules (use --break-system-packages for Ubuntu 24.04)
+RUN pip install --break-system-packages pandas msgspec pyzmq
 
 # Install NIXL python package
 RUN if [ -f /workspace/nixl/requirements.txt ]; then \
-      pip install -r /workspace/nixl/requirements.txt; \
+      pip install --break-system-packages -r /workspace/nixl/requirements.txt; \
     fi
-RUN pip install .
+RUN pip install --break-system-packages .
 
 # =============================================================================
 # Build nixlbench
@@ -270,7 +270,7 @@ RUN ldconfig && \
 # =============================================================================
 # Install PyTorch with ROCm support
 # =============================================================================
-RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/rocm6.2
+RUN pip install --break-system-packages --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/rocm6.2
 
 # =============================================================================
 # Build vLLM with ROCm
@@ -287,7 +287,7 @@ RUN git checkout v0.10.0 || git checkout main
 # Install build requirements (excluding torch)
 RUN set -eux; \
     sed '/^torch/d' requirements/build.txt > /tmp/req-no-torch.txt; \
-    pip install --no-cache-dir -r /tmp/req-no-torch.txt; \
+    pip install --break-system-packages --no-cache-dir -r /tmp/req-no-torch.txt; \
     rm -f /tmp/req-no-torch.txt
 
 # Patch setup.py to fix runtime environment detection
@@ -307,14 +307,14 @@ ENV VLLM_INSTALL_PUNICA_KERNELS=1
 RUN export VLLM_TARGET_DEVICE=rocm && \
     export VLLM_BUILD_ENVIRONMENT=local && \
     export VLLM_INSTALL_PUNICA_KERNELS=1 && \
-    pip install --no-build-isolation -e .
+    pip install --break-system-packages --no-build-isolation -e .
 
 # =============================================================================
 # Install LMCache with ROCm support
 # =============================================================================
 WORKDIR ${TOPDIR}
 
-RUN pip install boto3 botocore pandas msgspec pyzmq aiofile redis sortedcontainers
+RUN pip install --break-system-packages boto3 botocore pandas msgspec pyzmq aiofile redis sortedcontainers
 
 # Clone LMCache
 RUN git clone --depth=1 -b wip-nixl-obj https://github.com/mmgaggle/LMCache.git ${TOPDIR}/LMCache
@@ -322,7 +322,7 @@ RUN git clone --depth=1 -b wip-nixl-obj https://github.com/mmgaggle/LMCache.git 
 WORKDIR ${TOPDIR}/LMCache
 
 # Install build requirements
-RUN pip install -r requirements/build.txt || true
+RUN pip install --break-system-packages -r requirements/build.txt || true
 
 # Patch setup.py to skip CUDA/HIP extensions for ROCm-only environment
 # This must be done BEFORE pip install attempts to parse setup.py
@@ -375,7 +375,7 @@ ENV CUDA_HOME=/opt/rocm
 ENV LMCACHE_SKIP_CUDA_BUILD=1
 
 # Install LMCache without CUDA extensions
-RUN pip install -e . --no-build-isolation --no-deps || \
+RUN pip install --break-system-packages -e . --no-build-isolation --no-deps || \
     (echo "ERROR: LMCache installation failed after patching. Check setup.py patch." && \
      echo "Continuing without LMCache..." && true)
 
