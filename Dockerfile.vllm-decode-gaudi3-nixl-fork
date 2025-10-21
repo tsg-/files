@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # syntax=docker/dockerfile:1.4
 
-# Dockerfile.vllm-decode-gaudi3-nixl
-# vLLM Decode Node for Intel Gaudi3 with NIXL, UCX-Gaudi, and LMCache
+# Dockerfile.vllm-decode-gaudi3-nixl-fork
+# vLLM Decode Node for Intel Gaudi3 with NIXL and LMCache (using local forks)
 # Starts from nixlbench base image
 #
-# Build: docker build --target nixlbench -f Dockerfile.nixlbench -t nixlbench .
-#        docker build -f Dockerfile.vllm-decode-gaudi3-nixl -t vllm-decode-gaudi3-nixl:latest .
+# Build from directory containing vllm-fork/ and LMCache-fork/:
+#   docker build --target nixlbench -f Dockerfile.nixlbench -t nixlbench .
+#   docker build -f Dockerfile.vllm-decode-gaudi3-nixl-fork -t vllm-decode-gaudi3-nixl-fork:latest .
 
-FROM nixlbench AS vllm-decode-gaudi3-nixl
+FROM nixlbench AS vllm-decode-gaudi3-nixl-fork
 
 ARG DEFAULT_PYTHON_VERSION="3.12"
 
@@ -81,47 +82,37 @@ RUN cd builddir && \
     ldconfig
 
 # =============================================================================
-# Build vLLM with Gaudi support
+# Build vLLM with Gaudi support (using local fork)
 # =============================================================================
 WORKDIR ${TOPDIR}
 
-# Clone vLLM-Gaudi to get stable commit reference
-RUN git clone --progress -v https://github.com/vllm-project/vllm-gaudi ${TOPDIR}/vllm-gaudi
-
-# Clone base vLLM
-RUN git clone --progress -v https://github.com/vllm-project/vllm ${TOPDIR}/vllm
+# Copy vLLM fork from host
+COPY vllm-fork/ ${TOPDIR}/vllm/
 WORKDIR ${TOPDIR}/vllm
 
-# Checkout stable commit for vLLM-Gaudi compatibility
-RUN export VLLM_COMMIT_HASH=$(cd ${TOPDIR}/vllm-gaudi && git show "origin/vllm/last-good-commit-for-vllm-gaudi:VLLM_STABLE_COMMIT" 2>/dev/null || echo "v0.10.0") \
-    && git checkout $VLLM_COMMIT_HASH || git checkout v0.10.0
-
 # Install build requirements (excluding torch to reuse Habana's torch)
+# Use BuildKit cache mount to speed up pip downloads
 RUN --mount=type=cache,target=/root/.cache/pip \
     grep -v '^torch' requirements/build.txt > /tmp/build_requirements.txt && \
     pip install -r /tmp/build_requirements.txt && \
     rm /tmp/build_requirements.txt
 
-# Build vLLM with empty device as base
-ENV VLLM_TARGET_DEVICE=empty
+# Build vLLM with Gaudi support (vllm-fork already has Gaudi support built-in)
+# Note: vllm-fork is assumed to be the HPU/Gaudi-enabled version
+ENV VLLM_TARGET_DEVICE=hpu
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-build-isolation -e .
 
-# Build vLLM-Gaudi extension
-WORKDIR ${TOPDIR}/vllm-gaudi
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -e .
-
 # =============================================================================
-# Install LMCache
+# Install LMCache (using local fork with HPU support)
 # =============================================================================
 WORKDIR ${TOPDIR}
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install boto3 botocore pandas msgspec pyzmq aiofile redis sortedcontainers
 
-# Clone LMCache
-RUN git clone --depth=1 -b wip-nixl-obj https://github.com/mmgaggle/LMCache.git ${TOPDIR}/LMCache
+# Copy LMCache fork from host (assumes HPU support is already built-in)
+COPY LMCache-fork/ ${TOPDIR}/LMCache/
 
 WORKDIR ${TOPDIR}/LMCache
 
@@ -129,105 +120,15 @@ WORKDIR ${TOPDIR}/LMCache
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements/build.txt || true
 
-# Patch setup.py to skip CUDA extensions for Gaudi-only environment
-# This must be done BEFORE pip install attempts to parse setup.py
-RUN python3 << 'PATCH_SETUP'
-import re
-
-print("Reading setup.py...")
-with open('setup.py', 'r') as f:
-    content = f.read()
-
-original = content
-patches = 0
-
-# Patch 1: Replace the entire cuda_extension function to return empty list
-pattern1 = r'def cuda_extension\([^)]*\):.*?(?=\ndef [a-z_]+|class |if __name__|$)'
-if re.search(pattern1, content, re.DOTALL):
-    content = re.sub(pattern1, 'def cuda_extension(*args, **kwargs):\n    """Disabled for non-CUDA environments"""\n    return []\n\n', content, flags=re.DOTALL)
-    patches += 1
-    print('✓ Patch 1: Replaced cuda_extension() function')
-
-# Patch 2: Replace cuda_extensions = cuda_extension(...) calls
-pattern2 = r'cuda_extensions\s*=\s*cuda_extension\([^)]*\)'
-if re.search(pattern2, content):
-    content = re.sub(pattern2, 'cuda_extensions = []  # Disabled for Gaudi', content)
-    patches += 1
-    print('✓ Patch 2: Set cuda_extensions = []')
-
-# Patch 3: Replace ext_modules = cuda_extensions
-pattern3 = r'ext_modules\s*=\s*cuda_extensions'
-if re.search(pattern3, content):
-    content = re.sub(pattern3, 'ext_modules = []  # Disabled for Gaudi', content)
-    patches += 1
-    print('✓ Patch 3: Set ext_modules = []')
-
-# Patch 4: Remove "Building CUDA extensions" print
-content = re.sub(r'print\(["\']Building CUDA extensions["\']\)', 'print("Skipping CUDA extensions for Gaudi")', content)
-
-if patches == 0:
-    print('WARNING: No patches applied! Pattern not found in setup.py')
-    print('First 50 lines of setup.py:')
-    print('\n'.join(content.split('\n')[:50]))
-else:
-    with open('setup.py', 'w') as f:
-        f.write(content)
-    print(f'✓ Successfully applied {patches} patches to setup.py')
-PATCH_SETUP
-
-# Set CUDA_HOME to a dummy path to avoid errors (Gaudi doesn't have CUDA)
-ENV CUDA_HOME=/usr
-ENV LMCACHE_SKIP_CUDA_BUILD=1
-
-# Install LMCache without CUDA extensions
-RUN pip install -e . --no-build-isolation --no-deps || \
-    (echo "ERROR: LMCache installation failed after patching. Check setup.py patch." && \
-     echo "Continuing without LMCache..." && true)
+# Install LMCache with HPU/Gaudi support
+# PT_HPU_GPU_MIGRATION=1 enables GPU-to-HPU migration layer
+ENV PT_HPU_GPU_MIGRATION=1
+RUN --mount=type=cache,target=/root/.cache/pip \
+    PT_HPU_GPU_MIGRATION=1 pip install -e .
 
 # Verify LMCache installation
-RUN python -c "import lmcache; print(f'LMCache: {lmcache.__version__}')" 2>/dev/null || \
+RUN python -c "import lmcache; print('LMCache installed successfully')" 2>/dev/null || \
     echo "LMCache not available (will use vLLM prefix caching only)"
-
-# Patch LMCache to fix HPU/Gaudi device detection issues
-RUN python3 << 'PATCH_LMCACHE'
-import re
-import os
-
-adapter_file = '/usr/local/lib/python3.12/dist-packages/lmcache/integration/vllm/vllm_v1_adapter.py'
-
-if not os.path.exists(adapter_file):
-    print('⚠ LMCache adapter not found, skipping patches')
-    exit(0)
-
-with open(adapter_file, 'r') as f:
-    content = f.read()
-
-patches_applied = 0
-
-# Patch 1: Fix ZeroDivisionError when num_gpus=0
-pattern1 = r'(\s+)local_rank = parallel_config\.rank % num_gpus'
-replacement1 = r'\1# Fixed for HPU/Gaudi: handle num_gpus=0\n\1local_rank = parallel_config.rank % num_gpus if num_gpus > 0 else parallel_config.rank'
-if re.search(pattern1, content):
-    content = re.sub(pattern1, replacement1, content)
-    patches_applied += 1
-    print('✓ Patch 1: Fixed ZeroDivisionError (num_gpus=0)')
-
-# Patch 2: Fix torch.cuda.set_device() call that doesn't exist in Habana PyTorch
-pattern2 = r'(\s+)torch\.cuda\.set_device\(local_rank\)'
-replacement2 = r'\1# Fixed for HPU/Gaudi: torch.cuda.set_device not available\n\1# HPU device selection is handled by habana_frameworks\n\1pass  # torch.cuda.set_device(local_rank)'
-if re.search(pattern2, content):
-    content = re.sub(pattern2, replacement2, content)
-    patches_applied += 1
-    print('✓ Patch 2: Fixed torch.cuda.set_device() for HPU')
-
-if patches_applied > 0:
-    with open(adapter_file, 'w') as f:
-        f.write(content)
-    print(f'✓ Applied {patches_applied} patch(es) to LMCache for HPU/Gaudi support')
-else:
-    print('⚠ No patches applied (patterns not found or already patched)')
-
-PATCH_LMCACHE
 
 # =============================================================================
 # Update benchmark scripts for Gaudi3
@@ -306,7 +207,8 @@ RUN chmod +x $HOME/.local/bin/nixlbench-obj.sh
 # =============================================================================
 # Save Build Version Information
 # =============================================================================
-RUN echo "=== Build Version Information ===" > /app/versions.txt && \
+RUN mkdir -p /app && \
+    echo "=== Build Version Information ===" > /app/versions.txt && \
     echo "BASE_IMAGE: nixlbench (Gaudi base)" >> /app/versions.txt && \
     echo "PYTHON_VERSION: ${DEFAULT_PYTHON_VERSION}" >> /app/versions.txt && \
     echo "" >> /app/versions.txt && \
@@ -328,21 +230,15 @@ RUN echo "=== Build Version Information ===" > /app/versions.txt && \
     (cd /workspace/nixl && echo "NIXL_BRANCH: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
     (cd /workspace/nixl && echo "NIXL_COMMIT: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
     echo "" >> /app/versions.txt && \
-    echo "=== vLLM Version ===" >> /app/versions.txt && \
-    echo "VLLM_REPO: https://github.com/vllm-project/vllm" >> /app/versions.txt && \
+    echo "=== vLLM Version (fork) ===" >> /app/versions.txt && \
+    (cd /workspace/vllm && echo "VLLM_REPO: $(git remote get-url origin 2>/dev/null || echo 'local-fork')" >> /app/versions.txt) && \
     (cd /workspace/vllm && echo "VLLM_BRANCH: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
     (cd /workspace/vllm && echo "VLLM_COMMIT: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
-    echo "VLLM_TARGET_DEVICE: empty (base)" >> /app/versions.txt && \
+    echo "VLLM_TARGET_DEVICE: hpu" >> /app/versions.txt && \
     echo "" >> /app/versions.txt && \
-    echo "=== vLLM-Gaudi Version ===" >> /app/versions.txt && \
-    echo "VLLM_GAUDI_REPO: https://github.com/vllm-project/vllm-gaudi" >> /app/versions.txt && \
-    (cd /workspace/vllm-gaudi && echo "VLLM_GAUDI_BRANCH: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
-    (cd /workspace/vllm-gaudi && echo "VLLM_GAUDI_COMMIT: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
-    (cd /workspace/vllm-gaudi && echo "VLLM_STABLE_COMMIT_REF: $(git show 'origin/vllm/last-good-commit-for-vllm-gaudi:VLLM_STABLE_COMMIT' 2>/dev/null || echo 'v0.10.0')" >> /app/versions.txt) && \
-    echo "" >> /app/versions.txt && \
-    echo "=== LMCache Version ===" >> /app/versions.txt && \
-    echo "LMCACHE_REPO: https://github.com/mmgaggle/LMCache.git" >> /app/versions.txt && \
-    echo "LMCACHE_BRANCH: wip-nixl-obj" >> /app/versions.txt && \
+    echo "=== LMCache Version (fork) ===" >> /app/versions.txt && \
+    (cd /workspace/LMCache && echo "LMCACHE_REPO: $(git remote get-url origin 2>/dev/null || echo 'local-fork')" >> /app/versions.txt) && \
+    (cd /workspace/LMCache && echo "LMCACHE_BRANCH: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
     (cd /workspace/LMCache && echo "LMCACHE_COMMIT: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
     echo "" >> /app/versions.txt && \
     echo "=== PyTorch Version ===" >> /app/versions.txt && \
@@ -365,7 +261,7 @@ COPY <<'ENTRYPOINT' /entrypoint-gaudi3-nixl.sh
 #!/bin/bash
 set -e
 
-echo "=== vLLM Decode Node (Intel Gaudi3) with NIXL ==="
+echo "=== vLLM Decode Node (Intel Gaudi3) with NIXL - Fork Version ==="
 echo "Habana Runtime: $(hl-smi --version 2>/dev/null || echo 'unknown')"
 echo "Visible Devices: ${HABANA_VISIBLE_DEVICES:-all}"
 

@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # syntax=docker/dockerfile:1.4
 
-# Dockerfile.vllm-prefill-mi300x-nixl
+# Dockerfile.vllm-prefill-mi300x-nixl-v2
 # vLLM Prefill Node for AMD MI300X with NIXL, UCX, and LMCache
-# Built from ROCm base (not Habana Gaudi)
+# Built from official ROCm vLLM image
 #
-# Build: docker build -f Dockerfile.vllm-prefill-mi300x-nixl -t vllm-prefill-mi300x-nixl:latest .
+# Build: docker build -f Dockerfile.vllm-prefill-mi300x-nixl-v2 -t vllm-prefill-mi300x-nixl:v2 .
 
-FROM rocm/dev-ubuntu-24.04:6.2 AS vllm-prefill-mi300x-nixl
+FROM rocm/vllm:rocm7.0.0_vllm_0.10.2_20251006 AS vllm-prefill-mi300x-nixl
 
 # ——————————————————————————————————————————————————
 # Pre‐declare all ENVs so later `ENV foo=$foo…` works without linter errors
@@ -23,8 +23,7 @@ ARG ARCH="x86_64"
 ARG DEFAULT_PYTHON_VERSION="3.12"
 ARG LIBFABRIC_REF="v1.22.x"
 ARG UCX_REF="v1.19.x"
-ARG ROCM_VER=6.2
-ARG UBUNTU_CODENAME=noble
+ARG ROCM_VER=7.0
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV HOME=/root
@@ -32,14 +31,18 @@ ENV PREFIX=$HOME/.local
 ENV TOPDIR=/workspace
 
 # ROCm is typically installed at /opt/rocm (symlink to /opt/rocm-x.y.z)
-# Use realpath to resolve symlinks and avoid build issues
 ENV ROCM_HOME=/opt/rocm
 ENV ROCM_PATH=/opt/rocm
 ENV PATH=$PREFIX/bin:$ROCM_HOME/bin:$PATH
 ENV LD_LIBRARY_PATH=$PREFIX/lib:$PREFIX/lib64:$PREFIX/lib/ucx:$PREFIX/lib/x86_64-linux-gnu:$ROCM_HOME/lib:$LD_LIBRARY_PATH
 
+# Set MI300X environment
+ENV HCC_AMDGPU_TARGET=gfx942
+ENV HSA_FORCE_FINE_GRAIN_PCIE=1
+ENV HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
 # =============================================================================
-# Verify ROCm installation
+# Verify ROCm and vLLM installation
 # =============================================================================
 RUN if [ ! -d /opt/rocm ]; then \
       echo "ERROR: ROCm not found at /opt/rocm"; \
@@ -51,8 +54,12 @@ RUN if [ ! -d /opt/rocm ]; then \
       echo "ROCm is a symlink to: $(readlink -f /opt/rocm)"; \
     fi
 
+# Verify vLLM is installed
+RUN python3 -c "import vllm; print(f'vLLM version: {vllm.__version__}')" || \
+    (echo "ERROR: vLLM not found in base image" && exit 1)
+
 # =============================================================================
-# Install base dependencies (from nixlbase, minus Gaudi-specific)
+# Install base dependencies for NIXL build
 # =============================================================================
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential git cmake ninja-build \
@@ -65,7 +72,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev uuid-dev zlib1g-dev libboost-all-dev \
     libibverbs-dev rdma-core ibverbs-utils libibumad-dev \
     librdmacm-dev ibverbs-providers meson \
-    python${DEFAULT_PYTHON_VERSION} python3-pip \
     ca-certificates gpg lsb-release unzip && \
     rm -rf /var/lib/apt/lists/*
 
@@ -76,26 +82,7 @@ RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tm
     rm -rf /tmp/awscliv2.zip /tmp/aws
 
 # =============================================================================
-# Install additional ROCm development packages for MI300X
-# =============================================================================
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    rocm-hip-sdk \
-    rocm-hip-runtime \
-    rocm-ml-libraries \
-    rocm-dev \
-    rocm-libs \
-    rocm-smi-lib \
-    hip-dev \
-    hipify-clang && \
-    rm -rf /var/lib/apt/lists/*
-
-# Set MI300X environment
-ENV HCC_AMDGPU_TARGET=gfx942
-ENV HSA_FORCE_FINE_GRAIN_PCIE=1
-ENV HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-
-# =============================================================================
-# Build libfabric (without Gaudi support, with verbs)
+# Build libfabric with ROCm support
 # =============================================================================
 WORKDIR /workspace
 RUN if ls libfabric-*.tar.gz 1> /dev/null 2>&1; then \
@@ -230,7 +217,7 @@ RUN cd builddir && \
     ldconfig && \
     cd .. && rm -rf builddir
 
-# Install python modules (use --break-system-packages for Ubuntu 24.04)
+# Install python modules
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --break-system-packages pandas msgspec pyzmq
 
@@ -268,50 +255,6 @@ RUN ldconfig && \
     ls -la $PREFIX/bin/ || true && \
     echo "Installed libraries:" && \
     find $PREFIX/lib* -name "*.so*" 2>/dev/null | head -10 || true
-
-# =============================================================================
-# Install PyTorch with ROCm support
-# =============================================================================
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --break-system-packages torch torchvision --index-url https://download.pytorch.org/whl/rocm6.2
-
-# =============================================================================
-# Build vLLM with ROCm
-# =============================================================================
-WORKDIR ${TOPDIR}
-
-# Clone vLLM
-RUN git clone -v https://github.com/vllm-project/vllm ${TOPDIR}/vllm
-WORKDIR ${TOPDIR}/vllm
-
-# Checkout stable commit (v0.10.0 or as needed)
-RUN git checkout v0.10.0 || git checkout main
-
-# Install build requirements (excluding torch)
-RUN set -eux; \
-    sed '/^torch/d' requirements/build.txt > /tmp/req-no-torch.txt; \
-    pip install --break-system-packages -r /tmp/req-no-torch.txt; \
-    rm -f /tmp/req-no-torch.txt
-
-# Patch setup.py to fix runtime environment detection
-RUN python3 -c "\
-import re; \
-content = open('setup.py', 'r').read(); \
-content = re.sub(r'raise RuntimeError\(\"Unknown runtime environment\"\)', 'return \"0.10.0+rocm\"', content); \
-open('setup.py', 'w').write(content); \
-print('Patched setup.py to bypass runtime environment detection')"
-
-# Build vLLM with ROCm
-ENV VLLM_TARGET_DEVICE=rocm
-ENV VLLM_BUILD_ENVIRONMENT=local
-ENV VLLM_INSTALL_PUNICA_KERNELS=1
-
-# Set environment variables inline to ensure they're available during build
-RUN --mount=type=cache,target=/root/.cache/pip \
-    export VLLM_TARGET_DEVICE=rocm && \
-    export VLLM_BUILD_ENVIRONMENT=local && \
-    export VLLM_INSTALL_PUNICA_KERNELS=1 && \
-    pip install --break-system-packages --no-build-isolation -e .
 
 # =============================================================================
 # Install LMCache with ROCm support
@@ -464,11 +407,10 @@ RUN chmod +x $HOME/.local/bin/nixlbench-local-ucxtcp.sh
 # Save Build Version Information
 # =============================================================================
 RUN echo "=== Build Version Information ===" > /app/versions.txt && \
-    echo "BASE_IMAGE: rocm/dev-ubuntu-24.04:6.2" >> /app/versions.txt && \
+    echo "BASE_IMAGE: rocm/vllm:rocm7.0.0_vllm_0.10.2_20251006" >> /app/versions.txt && \
     echo "ARCH: ${ARCH}" >> /app/versions.txt && \
     echo "PYTHON_VERSION: ${DEFAULT_PYTHON_VERSION}" >> /app/versions.txt && \
     echo "ROCM_VERSION: ${ROCM_VER}" >> /app/versions.txt && \
-    echo "UBUNTU_CODENAME: ${UBUNTU_CODENAME}" >> /app/versions.txt && \
     echo "" >> /app/versions.txt && \
     echo "=== Dependency Versions ===" >> /app/versions.txt && \
     echo "LIBFABRIC_REF: ${LIBFABRIC_REF}" >> /app/versions.txt && \
@@ -483,10 +425,8 @@ RUN echo "=== Build Version Information ===" > /app/versions.txt && \
     echo "NIXL_BRANCH: obj_dns_fix" >> /app/versions.txt && \
     (cd /workspace/nixl && echo "NIXL_COMMIT: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
     echo "" >> /app/versions.txt && \
-    echo "=== vLLM Version ===" >> /app/versions.txt && \
-    echo "VLLM_REPO: https://github.com/vllm-project/vllm" >> /app/versions.txt && \
-    (cd /workspace/vllm && echo "VLLM_BRANCH: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
-    (cd /workspace/vllm && echo "VLLM_COMMIT: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> /app/versions.txt) && \
+    echo "=== vLLM Version (from base image) ===" >> /app/versions.txt && \
+    (python -c "import vllm; print(f'VLLM_VERSION: {vllm.__version__}')" >> /app/versions.txt 2>/dev/null || echo "VLLM_VERSION: 0.10.2 (from base)" >> /app/versions.txt) && \
     echo "VLLM_TARGET_DEVICE: rocm" >> /app/versions.txt && \
     echo "" >> /app/versions.txt && \
     echo "=== LMCache Version ===" >> /app/versions.txt && \
@@ -518,6 +458,9 @@ echo "=== vLLM Prefill Node (AMD MI300X) with NIXL ==="
 echo "ROCm Version: $(cat /opt/rocm/.info/version 2>/dev/null || echo 'unknown')"
 echo "Visible GPUs: ${HIP_VISIBLE_DEVICES:-all}"
 
+# Verify vLLM
+python -c "import vllm; print(f'vLLM: {vllm.__version__}')" 2>/dev/null || echo "Warning: vLLM not available"
+
 # Verify ROCm
 rocm-smi --showproductname 2>/dev/null || echo "Warning: rocm-smi not available"
 
@@ -532,6 +475,11 @@ ldd $(which python) | grep -E "(libfabric|ucx)" || echo "Warning: libfabric/ucx 
 
 # Verify NIXL
 nixlbench --help 2>&1 | head -5 || echo "Warning: nixlbench not available"
+
+# Display version information
+echo ""
+echo "=== Installed Components ==="
+cat /app/versions.txt 2>/dev/null || echo "Version info not available"
 
 exec "$@"
 ENTRYPOINT
