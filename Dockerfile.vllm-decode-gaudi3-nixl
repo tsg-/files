@@ -125,9 +125,11 @@ RUN git clone --depth=1 -b wip-nixl-obj https://github.com/mmgaggle/LMCache.git 
 
 WORKDIR ${TOPDIR}/LMCache
 
-# Install build requirements
+# Install build requirements (excluding torch to reuse Habana's torch)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r requirements/build.txt || true
+    grep -v '^torch' requirements/build.txt > /tmp/lmcache_build_requirements.txt && \
+    pip install -r /tmp/lmcache_build_requirements.txt || true && \
+    rm /tmp/lmcache_build_requirements.txt
 
 # Patch setup.py to skip CUDA extensions for Gaudi-only environment
 # This must be done BEFORE pip install attempts to parse setup.py

@@ -1,0 +1,16 @@
+chunk_size: 256
+local_cpu: False
+max_local_cpu_size: 50
+remote_url: "s3://lmcache"
+save_unfull_chunk: False
+enable_async_loading: True
+remote_serde: "naive"
+blocking_timeout_secs: 100
+extra_config:
+  s3_max_io_concurrency: 320
+  s3_max_inflight_reqs: 320
+  s3_prefer_http2: False
+  s3_region: "default"
+  s3_enable_s3express: False
+  save_chunk_meta: False
+  s3_file_prefix: "test-2"

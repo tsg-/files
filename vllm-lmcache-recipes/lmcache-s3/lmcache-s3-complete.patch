@@ -1,0 +1,2043 @@
+From c0988e4c41f1d44564f6909b3397b43dc68d0c70 Mon Sep 17 00:00:00 2001
+From: Jiayi Yao <82156730+YaoJiayi@users.noreply.github.com>
+Date: Mon, 18 Aug 2025 00:28:37 -0700
+Subject: [PATCH] [Enhancement] Adding S3 connector (#1374)
+
+* checkpoint
+
+Signed-off-by: YaoJiayi <120040070@link.cuhk.edu.cn>
+
+* finalize
+
+Signed-off-by: YaoJiayi <120040070@link.cuhk.edu.cn>
+
+* finalize
+
+Signed-off-by: YaoJiayi <120040070@link.cuhk.edu.cn>
+
+* make runnable
+
+Signed-off-by: YaoJiayi <120040070@link.cuhk.edu.cn>
+
+* add comment
+
+Signed-off-by: YaoJiayi <120040070@link.cuhk.edu.cn>
+
+---------
+
+Signed-off-by: YaoJiayi <120040070@link.cuhk.edu.cn>
+---
+ lmcache/utils.py                              |  30 +
+ lmcache/v1/config.py                          |   2 +-
+ lmcache/v1/memory_management.py               |  19 +
+ .../v1/storage_backend/connector/__init__.py  |   8 +
+ .../connector/base_connector.py               |  11 +-
+ .../storage_backend/connector/s3_adapter.py   |  58 ++
+ .../storage_backend/connector/s3_connector.py | 520 ++++++++++++++++++
+ lmcache/v1/storage_backend/storage_manager.py |  13 +-
+ 8 files changed, 656 insertions(+), 5 deletions(-)
+ create mode 100644 lmcache/v1/storage_backend/connector/s3_adapter.py
+ create mode 100644 lmcache/v1/storage_backend/connector/s3_connector.py
+
+diff --git a/lmcache/utils.py b/lmcache/utils.py
+index 83a761a..c07d801 100644
+--- a/lmcache/utils.py
++++ b/lmcache/utils.py
+@@ -5,17 +5,24 @@ from __future__ import annotations
+ # Standard
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, List, Optional, OrderedDict, Tuple
++import asyncio
+ import hashlib
+ import threading
++import traceback
+ 
+ # Third Party
+ from nvtx import annotate  # type: ignore
+ import torch
+ 
++# First Party
++from lmcache.logging import init_logger
++
+ if TYPE_CHECKING:
+     # First Party
+     from lmcache.v1.memory_management import MemoryFormat
+ 
++logger = init_logger(__name__)
++
+ # Type definition
+ KVCache = Tuple[Tuple[torch.Tensor, torch.Tensor], ...]
+ 
+@@ -300,3 +307,26 @@ def thread_safe(func):
+         return result
+ 
+     return wrapper
++
++
++#### Thread/asyncio-related utilities ####
++def handle_thread_exception(args):
++    logger.error(
++        f"Thread {args.thread.name} crashed: {args.exc_type.__name__}: {args.exc_value}"
++    )
++
++
++def start_loop_in_thread_with_exceptions(loop: asyncio.AbstractEventLoop):
++    # The loop must be set in the *same* thread where it runs.
++    asyncio.set_event_loop(loop)
++
++    # Catch unhandled exceptions from callbacks/tasks in this loop:
++    def loop_excepthook(loop, context):
++        msg = context.get("message", "Unhandled exception in event loop")
++        exc = context.get("exception")
++        logger.error(f"[asyncio] {msg}")
++        if exc:
++            traceback.print_exception(type(exc), exc, exc.__traceback__)
++
++    loop.set_exception_handler(loop_excepthook)
++    loop.run_forever()
+diff --git a/lmcache/v1/config.py b/lmcache/v1/config.py
+index 1d1181e..d2f3792 100644
+--- a/lmcache/v1/config.py
++++ b/lmcache/v1/config.py
+@@ -434,7 +434,7 @@ def _from_file(cls, file_path: str):
+ 
+         # Validate remote_url format
+         if name == "remote_url" and value is not None:
+-            if not re.match(r"(.*)://(.*):(\d+)", value):
++            if not re.match(r"(.*)://(.*)", value):
+                 raise ValueError(f"Invalid remote storage url: {value}")
+ 
+         config_values[name] = value
+diff --git a/lmcache/v1/memory_management.py b/lmcache/v1/memory_management.py
+index 8fcd6ff..304d44a 100644
+--- a/lmcache/v1/memory_management.py
++++ b/lmcache/v1/memory_management.py
+@@ -254,6 +254,15 @@ class MemoryObj(metaclass=abc.ABCMeta):
+         """
+         raise NotImplementedError
+ 
++    @property
++    @abc.abstractmethod
++    def data_ptr(self) -> int:
++        """
++        Get the data pointer of the MemoryObj.
++        This is used to access the raw data in the memory.
++        """
++        raise NotImplementedError
++
+     @property
+     @abc.abstractmethod
+     def is_pinned(self) -> bool:
+@@ -402,6 +411,10 @@ class TensorMemoryObj(MemoryObj):
+         )
+         return memoryview(byte_array)
+ 
++    @property
++    def data_ptr(self) -> int:
++        return self.raw_data.data_ptr()
++
+     @property
+     def is_pinned(self) -> bool:
+         return self.metadata.pin_count > 0
+@@ -502,6 +515,12 @@ class BytesBufferMemoryObj(MemoryObj):
+     def byte_array(self) -> bytes:
+         return self.raw_data
+ 
++    @property
++    def data_ptr(self) -> int:
++        mv = memoryview(self.raw_data)
++        addr = ctypes.addressof(ctypes.c_char.from_buffer(mv))
++        return addr
++
+     @property
+     def is_pinned(self) -> bool:
+         return self.metadata.pin_count > 0
+diff --git a/lmcache/v1/storage_backend/connector/__init__.py b/lmcache/v1/storage_backend/connector/__init__.py
+index e72f27c..6819549 100644
+--- a/lmcache/v1/storage_backend/connector/__init__.py
++++ b/lmcache/v1/storage_backend/connector/__init__.py
+@@ -138,6 +138,7 @@ class ConnectorManager:
+         config: Optional[LMCacheEngineConfig] = None,
+         metadata: Optional[LMCacheEngineMetadata] = None,
+     ) -> None:
++        logger.info("Initializing ConnectorManager")
+         self.context = ConnectorContext(
+             url=url,
+             loop=loop,
+@@ -189,6 +190,7 @@ class ConnectorManager:
+             if adapter.can_parse(self.context.url):
+                 connector = adapter.create_connector(self.context)
+                 connector.init_chunk_meta(self.context.config, self.context.metadata)
++                connector.post_init()
+                 return connector
+ 
+         raise ValueError(f"No adapter found for URL: {self.context.url}")
+@@ -214,6 +216,9 @@ def CreateConnector(
+     - blackhole://[any_text]
+     - audit://host:port[?verify=true|false]
+     - fs://[host:port]/path
++    - s3://[bucket].s3express-[az_id].[region].amazonaws.com"
++    or
++    - s3://[bucket].s3.[region].amazonaws.com
+ 
+     Examples:
+     - redis://localhost:6379
+@@ -226,6 +231,9 @@ def CreateConnector(
+     - audit://localhost:8080?verify=true
+     - fs:///tmp/lmcache
+     - external://host:0/external_log_connector.lmc_external_log_connector/?connector_name=ExternalLogConnector
++    - s3://fakefile--use1-az4--x-s3.s3express-use1-az4.us-east-1.amazonaws.com
++    or
++    - s3://fakefile--use1-az4--x-s3.s3.us-east-1.amazonaws.com
+ 
+     Args:
+         url: The remote URL
+diff --git a/lmcache/v1/storage_backend/connector/base_connector.py b/lmcache/v1/storage_backend/connector/base_connector.py
+index ffcee0e..b2f223c 100644
+--- a/lmcache/v1/storage_backend/connector/base_connector.py
++++ b/lmcache/v1/storage_backend/connector/base_connector.py
+@@ -103,13 +103,20 @@ class RemoteConnector(metaclass=abc.ABCMeta):
+ 
+         return memory_obj
+ 
++    def post_init(self):
++        """
++        Post-initialization method to be called after the connector is created.
++        This can be used to perform any additional setup required by the connector.
++        """
++        logger.info("Dummy post-initializing remote connector")
++
+     @abc.abstractmethod
+     async def exists(self, key: CacheEngineKey) -> bool:
+         """
+         Check if the remote server contains the key
+ 
+         Input:
+-            key: a string
++            key: a CacheEngineKey
+ 
+         Returns:
+             True if the cache engine contains the key, False otherwise
+@@ -122,7 +129,7 @@ class RemoteConnector(metaclass=abc.ABCMeta):
+         Check if the remote server contains the key synchronized
+ 
+         Input:
+-            key: a string
++            key: a CacheEngineKey
+ 
+         Returns:
+             True if the cache engine contains the key, False otherwise
+diff --git a/lmcache/v1/storage_backend/connector/s3_adapter.py b/lmcache/v1/storage_backend/connector/s3_adapter.py
+new file mode 100644
+index 0000000..7abd2ad
+--- /dev/null
++++ b/lmcache/v1/storage_backend/connector/s3_adapter.py
+@@ -0,0 +1,58 @@
++# SPDX-License-Identifier: Apache-2.0
++# First Party
++from lmcache.logging import init_logger
++from lmcache.v1.storage_backend.connector import (
++    ConnectorAdapter,
++    ConnectorContext,
++)
++from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
++
++logger = init_logger(__name__)
++
++
++class S3ConnectorAdapter(ConnectorAdapter):
++    """Adapter for S3 Server connectors."""
++
++    def __init__(self) -> None:
++        super().__init__("s3://")
++
++    def can_parse(self, url: str) -> bool:
++        return url.startswith(self.schema)
++
++    def create_connector(self, context: ConnectorContext) -> RemoteConnector:
++        # Local
++        from .s3_connector import S3Connector
++
++        config = context.config
++
++        if config.extra_config is not None:
++            logger.info(config.extra_config)
++            # Different parts can be transferred in parallel.
++            self.s3_part_size = config.extra_config.get("s3_part_size", None)
++            self.s3_max_io_concurrency = config.extra_config.get(
++                "s3_max_io_concurrency", 64
++            )
++            self.s3_max_inflight_reqs = config.extra_config.get(
++                "s3_max_inflight_reqs", 64
++            )
++            self.s3_prefer_http2 = config.extra_config.get("s3_prefer_http2", True)
++            self.s3_region = config.extra_config.get("s3_region", None)
++            self.s3_enable_s3express = config.extra_config.get(
++                "s3_enable_s3express", True
++            )
++
++        logger.info(f"Creating S3 connector for URL: {context.url}")
++
++        s3_endpoint = context.url
++
++        return S3Connector(
++            s3_endpoint=s3_endpoint,
++            loop=context.loop,
++            local_cpu_backend=context.local_cpu_backend,
++            s3_part_size=self.s3_part_size,
++            s3_max_io_concurrency=self.s3_max_io_concurrency,
++            s3_max_inflight_reqs=self.s3_max_inflight_reqs,
++            s3_prefer_http2=self.s3_prefer_http2,
++            s3_region=self.s3_region,
++            s3_enable_s3express=self.s3_enable_s3express,
++        )
+diff --git a/lmcache/v1/storage_backend/connector/s3_connector.py b/lmcache/v1/storage_backend/connector/s3_connector.py
+new file mode 100644
+index 0000000..d3f2dd0
+--- /dev/null
++++ b/lmcache/v1/storage_backend/connector/s3_connector.py
+@@ -0,0 +1,520 @@
++# SPDX-License-Identifier: Apache-2.0
++# Standard
++from typing import List, Optional
++from urllib.parse import quote as url_quote
++import asyncio
++import ctypes
++import mmap
++import os
++import tempfile
++import threading
++
++# Third Party
++from awscrt import auth, io, s3
++from awscrt.http import HttpHeaders, HttpRequest
++from awscrt.io import ClientTlsContext, TlsConnectionOptions, TlsContextOptions
++
++# First Party
++from lmcache.logging import init_logger
++from lmcache.utils import CacheEngineKey
++from lmcache.v1.memory_management import MemoryObj
++from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
++from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
++
++logger = init_logger(__name__)
++
++
++# TODO(Jiayi): Some pending problems.
++# (1) We might need a filesystem-like allocator.
++# This could be useful for local disk `LocalDiskBackend` and
++# `/dev/shm` in `S3Connector`
++# (2) Need to hack amazon python s3 crt library to enable `offset`
++# to achieve zero-copy.
++# (3) Need a job manager so that we can do sth like
++# write priority, read priority, etc.
++# (4) Potentially can drop the semaphore to reduce the complexity.
++# Let crt handle the scheduling.
++
++
++class AdhocSharedMemoryManager:
++    """
++    A shared memory manager that allocates shared memory buffers
++    on demand.
++    """
++
++    def __init__(
++        self,
++        shm_buffers: list[int],
++        shm_names: list[str],
++        mmaps: list[mmap.mmap],
++    ):
++        self.shm_buffers = shm_buffers
++        self.shm_names = shm_names
++        self.mmaps = mmaps
++
++    def allocate(self) -> tuple[str, int]:
++        """
++        Allocate a shared memory buffer and return its name and a bytearray
++        that can be used to access the buffer.
++        """
++        if not self.shm_buffers:
++            raise RuntimeError("No more shared memory buffers available")
++
++        shm = self.shm_buffers.pop()
++        shm_name = self.shm_names.pop()
++        return shm_name, shm
++
++    def free(
++        self,
++        shm_name: str,
++        shm: int,
++    ) -> None:
++        """
++        Free a shared memory buffer.
++        """
++
++        self.shm_buffers.append(shm)
++        self.shm_names.append(shm_name)
++
++
++class S3Connector(RemoteConnector):
++    """
++    S3 remote connector
++    """
++
++    def __init__(
++        self,
++        s3_endpoint: str,
++        loop: asyncio.AbstractEventLoop,
++        local_cpu_backend: LocalCPUBackend,
++        s3_part_size: Optional[int],
++        s3_max_io_concurrency: int,
++        s3_max_inflight_reqs: int,
++        s3_prefer_http2: bool,
++        s3_region: str,
++        s3_enable_s3express: bool,
++    ):
++        if not s3_endpoint.startswith("s3://"):
++            raise ValueError("S3 url must start with 's3://'")
++
++        self.s3_endpoint = s3_endpoint.removeprefix("s3://")
++        self.loop = loop
++        self.local_cpu_backend = local_cpu_backend
++
++        self.s3_part_size = s3_part_size
++
++        # TODO(Jiayi): Now we only assume S3 part size = chunk size
++        assert self.s3_part_size == self.full_chunk_size, (
++            "S3 part size must be equal to chunk size in S3Connector"
++        )
++
++        self.s3_max_io_concurrency = s3_max_io_concurrency
++        self.s3_max_inflight_reqs = s3_max_inflight_reqs
++        self.s3_prefer_http2 = s3_prefer_http2
++        self.s3_region = s3_region
++        self.s3_enable_s3express = s3_enable_s3express
++
++        event_loop_group = io.EventLoopGroup(s3_max_io_concurrency)
++        host_resolver = io.DefaultHostResolver(event_loop_group)
++        client_bootstrap = io.ClientBootstrap(event_loop_group, host_resolver)
++        self.credentials_provider = auth.AwsCredentialsProvider.new_default_chain(
++            client_bootstrap
++        )
++
++        tls_opts = None
++        if self.s3_prefer_http2:
++            # Use HTTP/2 multiplexing if possible.
++            tls_ctx = ClientTlsContext(TlsContextOptions())
++            tls_opts = TlsConnectionOptions(tls_ctx)
++            try:
++                tls_opts.set_alpn_list(["h2", "http/1.1"])
++            except Exception:
++                tls_opts = None
++
++        logger.info("Initializing S3 client")
++        self.s3_client = s3.S3Client(
++            bootstrap=client_bootstrap,
++            region=s3_region,
++            credential_provider=self.credentials_provider,
++            enable_s3express=True,
++            tls_connection_options=tls_opts,
++        )
++
++        # TODO(Jiayi): We need to handle cache consistency issues in a systematic way
++        # across all connectors.
++        # We assume S3 cache is never evicted and read-only for now.
++        self.object_size_cache = {}
++
++        self.inflight_sema = asyncio.Semaphore(s3_max_inflight_reqs)
++
++    def post_init(self):
++        logger.info("Post-initializing S3 connector")
++
++        if self.s3_part_size is None:
++            # Default to chunk size
++            self.s3_part_size = self.full_chunk_size
++        assert self.s3_part_size == self.full_chunk_size, (
++            "S3 part size must be equal to chunk size in S3Connector"
++        )
++
++        shm_name_prefix = "my_shm"
++        shms = []
++        shm_names = []
++        mmaps = []
++        for i in range(self.s3_max_inflight_reqs):
++            shm_name = f"{shm_name_prefix}_{i}"
++
++            shm = tempfile.NamedTemporaryFile(
++                prefix=shm_name, suffix=".part", dir="/dev/shm", delete=False
++            )
++
++            os.ftruncate(shm.fileno(), self.full_chunk_size)
++
++            with open(shm.name, "r+b") as f:
++                mm = mmap.mmap(f.fileno(), self.full_chunk_size)
++                # create a char buffer view over the mmap
++                buf = ctypes.c_char.from_buffer(mm)
++                addr = ctypes.addressof(buf)
++
++            shms.append(addr)
++            shm_names.append(shm.name)
++            mmaps.append(mm)
++
++        self.adhoc_shm_manager = AdhocSharedMemoryManager(
++            shm_buffers=shms,
++            shm_names=shm_names,
++            mmaps=mmaps,
++        )
++
++    def _format_safe_path(self, key_str: str) -> str:
++        """
++        Generate a safe HTTP path for the S3 key.
++        This is necessary because S3 keys can contain special characters
++        that need to be URL-encoded.
++        """
++        flat_key_str = key_str.replace("/", "_")
++        return url_quote(flat_key_str, safe="")
++
++    # TODO(Jiayi): optimize this with async
++    def _get_object_size(self, key_str: str) -> int:
++        headers = HttpHeaders()
++        headers.add("Host", self.s3_endpoint)
++        req = HttpRequest("HEAD", f"/{self._format_safe_path(key_str)}", headers)
++
++        got = {"len": None, "status": None, "err": None}
++
++        def on_headers(status_code, headers, **kwargs):
++            got["status"] = status_code
++            for name, value in headers:
++                if name.lower() == "content-length":
++                    try:
++                        got["len"] = int(value)
++                    except Exception:
++                        pass
++
++        def on_done(error=None, **kwargs):
++            got["err"] = error
++
++        s3_req = s3.S3Request(
++            client=self.s3_client,
++            type=s3.S3RequestType.DEFAULT,
++            request=req,
++            operation_name="HeadObject",
++            on_headers=on_headers,
++            on_done=on_done,
++            credential_provider=self.credentials_provider,
++            region=self.s3_region,
++        )
++
++        try:
++            s3_req.finished_future.result()
++        except Exception as e:
++            logger.debug(f"Exception in `_get_object_size`: {e}")
++            return 0
++        if got["err"] or got["status"] != 200:
++            logger.warning("Encountering error in S3 HEAD request")
++            return 0
++        return got["len"]
++
++    # TODO(Jiayi): implement real async
++    async def exists(self, key: CacheEngineKey) -> bool:
++        return self.exists_sync(key)
++
++    def exists_sync(self, key: CacheEngineKey) -> bool:
++        key_str = key.to_string()
++        if key_str in self.object_size_cache:
++            return True
++        cache_size = self._get_object_size(key_str)
++        if cache_size > 0:
++            self.object_size_cache[key_str] = cache_size
++            return True
++        return False
++
++    def _s3_download(
++        self,
++        key_str: str,
++        obj_size: int,
++        memory_obj: MemoryObj,
++        recv_path: str,
++        done_event: threading.Event,
++    ):
++        """
++        Download a file from S3.
++        """
++        headers = HttpHeaders()
++        headers.add("Host", self.s3_endpoint)
++
++        # TODO(Jiayi): Enable more finegrained data partition
++        # range_header = f"bytes={start_byte}-{end_byte}"
++        # headers.add("Range", range_header)
++
++        req = HttpRequest("GET", f"/{self._format_safe_path(key_str)}", headers)
++
++        # NOTE(Jiayi): Run in crt threads (not this thread) with GIL
++        # See https://github.com/awslabs/aws-crt-python/blob/4250709624119de1af3ca86816e1a154fcac7cc8/source/common.c#L51
++        def on_done(error=None, status_code=None, **kwargs):
++            ok = (status_code in (200, 206)) or (status_code is None)
++            if error or not ok:
++                raise RuntimeError(
++                    f"Failed to download {key_str} from S3: {error or status_code}"
++                )
++
++            done_event.set()
++
++        # TODO(Jiayi): Need to support offset to enable zero-copy
++        # More concretely, we need to get the shared memory offset.
++        s3.S3Request(
++            client=self.s3_client,
++            type=s3.S3RequestType.GET_OBJECT,
++            request=req,
++            operation_name="GetObject",
++            recv_filepath=recv_path,
++            credential_provider=self.credentials_provider,
++            region=self.s3_region,
++            on_done=on_done,
++        )
++
++    async def get(self, key: CacheEngineKey) -> Optional[MemoryObj]:
++        key_str = key.to_string()
++
++        obj_size = self.object_size_cache.get(key_str, None)
++
++        if obj_size is None:
++            obj_size = self._get_object_size(key_str)
++            if obj_size <= 0:
++                return None
++            self.object_size_cache[key_str] = obj_size
++
++        await self.inflight_sema.acquire()
++
++        memory_obj = self.local_cpu_backend.allocate(
++            self.meta_shape,
++            self.meta_dtype,
++            self.meta_fmt,
++        )
++
++        # TODO(Jiayi): Please support this
++        assert obj_size == memory_obj.get_size(), (
++            "Saving unfull chunk is not supported in S3Connector."
++        )
++
++        done_event = threading.Event()
++
++        # TODO(Jiayi): Need to support offset to enable zero-copy
++        # We probably need to get the shared memory offset directly from memory object.
++        recv_path, shm = self.adhoc_shm_manager.allocate()
++
++        self._s3_download(
++            key_str=key_str,
++            obj_size=obj_size,
++            memory_obj=memory_obj,
++            recv_path=recv_path,
++            done_event=done_event,
++        )
++
++        while not done_event.is_set():
++            await asyncio.sleep(0.005)
++
++        dst_ptr = memory_obj.data_ptr
++        ctypes.memmove(dst_ptr, shm, obj_size)
++
++        self.adhoc_shm_manager.free(recv_path, shm)
++
++        self.inflight_sema.release()
++
++        return memory_obj
++
++    async def batched_get(
++        self, keys: List[CacheEngineKey]
++    ) -> List[Optional[MemoryObj]]:
++        done_events = []
++        shms = []
++        memory_objs = []
++        obj_sizes = []
++
++        # TODO(Jiayi): Need to resolve this
++        assert len(keys) <= self.s3_max_inflight_reqs, (
++            f"Too many keys {len(keys)} to get in a single pass, "
++            f"max is {self.s3_max_inflight_reqs}"
++        )
++
++        # TODO(Jiayi): Need some error handling in this loop.
++        for key in keys:
++            key_str = key.to_string()
++
++            obj_size = self.object_size_cache.get(key_str, None)
++
++            if obj_size is None:
++                obj_size = self._get_object_size(key_str)
++                if obj_size <= 0:
++                    obj_sizes.append(0)
++                    memory_objs.append(None)
++                    return None
++                self.object_size_cache[key_str] = obj_size
++
++            # TODO(Jiayi): A caveat of acquire this semaphore
++            # is that we might face deadlock when `batched_put`
++            # (not supported) is supported in the same fashion.
++            await self.inflight_sema.acquire()
++
++            memory_obj = self.local_cpu_backend.allocate(
++                self.meta_shape,
++                self.meta_dtype,
++                self.meta_fmt,
++            )
++
++            obj_sizes.append(obj_size)
++            memory_objs.append(memory_obj)
++
++            if not memory_obj:
++                shms.append(None)
++                self.inflight_sema.release()
++                continue
++
++            # TODO(Jiayi): Please support this
++            assert obj_size == memory_obj.get_size(), (
++                "Saving unfull chunk is not supported in S3Connector."
++            )
++
++            done_event = threading.Event()
++            done_events.append(done_event)
++
++            recv_path, shm = self.adhoc_shm_manager.allocate()
++            self._s3_download(
++                key_str=key_str,
++                obj_size=obj_size,
++                memory_obj=memory_obj,
++                recv_path=recv_path,
++                done_event=done_event,
++            )
++            shms.append(shm)
++
++        while not all(e.is_set() for e in done_events):
++            await asyncio.sleep(0.005)
++
++        for obj_size, memory_obj, shm in zip(
++            obj_sizes, memory_objs, shms, strict=False
++        ):
++            if memory_obj is None:
++                continue
++
++            dst_ptr = memory_obj.data_ptr
++            ctypes.memmove(dst_ptr, shm, obj_size)
++
++            self.adhoc_shm_manager.free(recv_path, shm)
++            self.inflight_sema.release()
++
++        return memory_objs
++
++    async def _s3_upload(
++        self,
++        key_str: str,
++        send_path: str,
++        done_event: threading.Event,
++    ):
++        """
++        Upload a file to S3.
++        """
++        headers = HttpHeaders()
++        headers.add("Host", self.s3_endpoint)
++
++        req = HttpRequest("PUT", f"/{self._format_safe_path(key_str)}", headers)
++
++        done = {"err": None, "status": None}
++
++        def on_done(error=None, status_code=None, **kwargs):
++            done["err"] = error
++            done["status"] = status_code
++
++            if done["err"] or done["status"] not in (200, 201):
++                raise RuntimeError(f"Upload failed in S3Connector: {done}")
++
++            done_event.set()
++
++        await self.inflight_sema.acquire()
++
++        s3.S3Request(
++            client=self.s3_client,
++            type=s3.S3RequestType.PUT_OBJECT,
++            request=req,
++            operation_name="PutObject",
++            send_filepath=send_path,
++            credential_provider=self.credentials_provider,
++            region=self.s3_region,
++            on_done=on_done,
++        )
++
++    async def put(self, key: CacheEngineKey, memory_obj: MemoryObj):
++        """
++        Store data to S3
++        """
++
++        key_str = key.to_string()
++
++        logger.debug(f"Uploading {key_str} to S3")
++
++        # TODO(Jiayi): Please support this
++        assert memory_obj.get_physical_size() == self.s3_part_size, (
++            "Saving unfull chunk is not supported in S3Connector."
++        )
++
++        await self.inflight_sema.acquire()
++        send_path, shm = self.adhoc_shm_manager.allocate()
++        logger.debug("Allocated shared memory for S3 upload")
++
++        try:
++            buffer_ptr = memory_obj.data_ptr
++            ctypes.memmove(shm, buffer_ptr, memory_obj.get_physical_size())
++        except Exception as e:
++            logger.error(f"Failed to copy data to S3 buffer: {e}")
++        logger.debug("Data copy to S3 buffer completed")
++
++        try:
++            done_event = threading.Event()
++            await self._s3_upload(key_str, send_path, done_event)
++            while not done_event.is_set():
++                await asyncio.sleep(0.005)
++        except Exception as e:
++            logger.error(f"Failed to upload {key_str} to S3: {e}")
++            raise
++        finally:
++            self.inflight_sema.release()
++            logger.debug(f"Uploaded {key_str} to S3 successfully")
++
++    async def list(self) -> List[str]:
++        raise NotImplementedError
++
++    def support_ping(self) -> bool:
++        return False
++
++    # TODO(Jiayi): This needs to be implemented.
++    async def ping(self) -> int:
++        raise NotImplementedError
++
++    def support_batched_get(self) -> bool:
++        return True
++
++    async def close(self):
++        for shm in self.shms:
++            shm.close()
++            shm.unlink()
+diff --git a/lmcache/v1/storage_backend/storage_manager.py b/lmcache/v1/storage_backend/storage_manager.py
+index d4a0c2f..4a2b1b3 100644
+--- a/lmcache/v1/storage_backend/storage_manager.py
++++ b/lmcache/v1/storage_backend/storage_manager.py
+@@ -18,7 +18,11 @@ import torch
+ # First Party
+ from lmcache.config import LMCacheEngineMetadata
+ from lmcache.logging import init_logger
+-from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
++from lmcache.utils import (
++    CacheEngineKey,
++    _lmcache_nvtx_annotate,
++    start_loop_in_thread_with_exceptions,
++)
+ from lmcache.v1.config import LMCacheEngineConfig
+ from lmcache.v1.lookup_server import LookupServerInterface
+ from lmcache.v1.memory_management import (
+@@ -52,7 +56,12 @@ class StorageManager:
+         lookup_server: Optional[LookupServerInterface] = None,
+     ):
+         self.loop = asyncio.new_event_loop()
+-        self.thread = threading.Thread(target=self.loop.run_forever)
++
++        self.thread = threading.Thread(
++            target=start_loop_in_thread_with_exceptions,
++            args=(self.loop,),
++            name="storage-manger-event-loop",
++        )
+         self.thread.start()
+ 
+         dst_device = "cuda"
+-- 
+2.51.0
+
+From 72e20180245f766fdeb965def6a2919026eba4d6 Mon Sep 17 00:00:00 2001
+From: Jiayi Yao <82156730+YaoJiayi@users.noreply.github.com>
+Date: Wed, 20 Aug 2025 20:49:38 -0700
+Subject: [PATCH] [Misc] Improve S3 a bit (#1402)
+
+* improve S3
+
+Signed-off-by: YaoJiayi <120040070@link.cuhk.edu.cn>
+
+* improve S3
+
+Signed-off-by: YaoJiayi <120040070@link.cuhk.edu.cn>
+
+* Update examples/kv_cache_reuse/remote_backends/s3/README.md
+
+Co-authored-by: gemini-code-assist[bot] <176961590+gemini-code-assist[bot]@users.noreply.github.com>
+Signed-off-by: Jiayi Yao <82156730+YaoJiayi@users.noreply.github.com>
+
+* Update lmcache/v1/storage_backend/connector/s3_connector.py
+
+Co-authored-by: gemini-code-assist[bot] <176961590+gemini-code-assist[bot]@users.noreply.github.com>
+Signed-off-by: Jiayi Yao <82156730+YaoJiayi@users.noreply.github.com>
+
+* Update examples/kv_cache_reuse/remote_backends/s3/README.md
+
+Co-authored-by: gemini-code-assist[bot] <176961590+gemini-code-assist[bot]@users.noreply.github.com>
+Signed-off-by: Jiayi Yao <82156730+YaoJiayi@users.noreply.github.com>
+
+---------
+
+Signed-off-by: YaoJiayi <120040070@link.cuhk.edu.cn>
+Signed-off-by: Jiayi Yao <82156730+YaoJiayi@users.noreply.github.com>
+Co-authored-by: gemini-code-assist[bot] <176961590+gemini-code-assist[bot]@users.noreply.github.com>
+---
+ .../remote_backends/s3/README.md              | 34 +++++++++++++++++++
+ .../remote_backends/s3/example.yaml           | 18 ++++++++++
+ lmcache/v1/cache_engine.py                    | 26 +++++++++++---
+ .../storage_backend/connector/s3_adapter.py   |  2 ++
+ .../storage_backend/connector/s3_connector.py | 23 ++++++-------
+ 5 files changed, 87 insertions(+), 16 deletions(-)
+ create mode 100644 examples/kv_cache_reuse/remote_backends/s3/README.md
+ create mode 100644 examples/kv_cache_reuse/remote_backends/s3/example.yaml
+
+diff --git a/examples/kv_cache_reuse/remote_backends/s3/README.md b/examples/kv_cache_reuse/remote_backends/s3/README.md
+new file mode 100644
+index 0000000..00a2d85
+--- /dev/null
++++ b/examples/kv_cache_reuse/remote_backends/s3/README.md
+@@ -0,0 +1,34 @@
++## LMCache can use [Amazon S3](https://aws.amazon.com/s3/) as a backend storage.
++
++Amazon Simple Storage Service (Amazon S3) is an object storage service offering industry-leading scalability, data availability, security, and performance.
++
++To maximize S3 performance, it's recommended to use [Amazon S3 Express One Zone storage class](https://aws.amazon.com/s3/storage-classes/express-one-zone/) and colocate your S3 bucket and [Amazon EC2 compute instance](https://aws.amazon.com/ec2/) in the same availability zone. 
++
++## Step 1: Configure your S3 bucket and (optional) EC2 compute instance
++
++See https://aws.amazon.com/s3/storage-classes/express-one-zone/ for configuring your S3 express-one-zone bucket. Normal S3 bucket is functional but gives worse performance.
++
++See https://aws.amazon.com/ec2/ for configuring your own EC2 compute instance. Your own server or other cloud servers also work but give worse performance.
++
++
++## Step 2: Fill out `example.yaml`
++
++Please fill out the `BUCKET_NAME`, `AZ_ID`, `REGION` and `FILE_PREFIX` in the `example.yaml`. `FILE_PREFIX` is optional and can be dropped. 
++
++## Step 3: Start an vLLM engine with LMCache
++
++```bash
++PYTHONHASHSEED=0 LMCACHE_CONFIG_FILE=example.yaml vllm serve meta-llama/Llama-3.1-8B-Instruct --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"}' --disable-log-requests --no-enable-prefix-caching
++```
++
++## Step 4: Sending requests
++
++You should be able to see cache hit on the second time by sending the following request twice:
++
++```bash
++curl -X POST http://localhost:8000/v1/completions   -H "Content-Type: application/json"   -d '{
++    "model": "meta-llama/Llama-3.1-8B-Instruct",
++    "prompt": "'"$(printf 'Elaborate the significance of KV cache in language models. %.0s' {1..1000})"'",
++    "max_tokens": 10
++  }'
++```
+\ No newline at end of file
+diff --git a/examples/kv_cache_reuse/remote_backends/s3/example.yaml b/examples/kv_cache_reuse/remote_backends/s3/example.yaml
+new file mode 100644
+index 0000000..d8efc8b
+--- /dev/null
++++ b/examples/kv_cache_reuse/remote_backends/s3/example.yaml
+@@ -0,0 +1,18 @@
++chunk_size: 256
++local_cpu: False
++max_local_cpu_size: 10
++save_unfull_chunk: False
++
++remote_url: "s3://{BUCKET_NAME}.s3express-{AZ_ID}.{REGION}.amazonaws.com"
++remote_serde: "naive"
++
++blocking_timeout_secs: 100
++
++extra_config:
++  s3_max_io_concurrency: 64
++  s3_max_inflight_reqs: 64
++  s3_prefer_http2: True
++  s3_region: "{REGION}"
++  s3_enable_s3express: True
++  save_chunk_meta: False
++  s3_file_prefix: "{FILE_PREFIX}"  # Optional prefix for S3 file paths
+\ No newline at end of file
+diff --git a/lmcache/v1/cache_engine.py b/lmcache/v1/cache_engine.py
+index 9bd65ca..83dfdd9 100644
+--- a/lmcache/v1/cache_engine.py
++++ b/lmcache/v1/cache_engine.py
+@@ -446,6 +446,9 @@ class LMCacheEngine:
+         :raises: ValueError if the number of Falses in the mask is not a
+             multiple of the chunk size.
+         """
++        tot_kv_size = 0
++        t = time.perf_counter()
++
+         if mask is not None:
+             num_required_tokens = torch.sum(mask).item()
+         else:
+@@ -456,7 +459,7 @@ class LMCacheEngine:
+ 
+         reordered_chunks: List[Tuple[CacheEngineKey, MemoryObj, int, int]] = []
+         if not self._is_passive():
+-            reordered_chunks = self._process_tokens_internal(
++            reordered_chunks, tot_kv_size = self._process_tokens_internal(
+                 tokens,
+                 mask,
+                 ret_mask,
+@@ -484,6 +487,8 @@ class LMCacheEngine:
+                 self.storage_manager.remove(key)
+             memory_obj.ref_count_down()
+ 
++        onload_time = time.perf_counter() - t
++
+         retrieved_tokens = torch.sum(ret_mask)
+         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
+         logger.info(
+@@ -491,6 +496,16 @@ class LMCacheEngine:
+             f"out of {num_required_tokens} "
+             f"out of total {len(tokens)} tokens"
+         )
++        logger.debug(
++            "Retrieved %d out of total %d out of total %d tokens. size: %.4f gb,"
++            " cost %.4f ms, throughput: %.4f GB/s;",
++            retrieved_tokens,
++            num_required_tokens,
++            len(tokens),
++            tot_kv_size / 1024**3,
++            onload_time * 1000,
++            tot_kv_size / onload_time / 1024**3,
++        )
+         return ret_mask
+ 
+     @_lmcache_nvtx_annotate
+@@ -956,7 +971,7 @@ class LMCacheEngine:
+         mask,
+         ret_mask,
+         **kwargs,
+-    ) -> List[Tuple[CacheEngineKey, MemoryObj, int, int]]:
++    ) -> Tuple[List[Tuple[CacheEngineKey, MemoryObj, int, int]], int]:
+         """Process tokens and populate the reordered lists.
+ 
+         This function is used to process tokens and populate the reordered lists.
+@@ -967,6 +982,8 @@ class LMCacheEngine:
+             ret_mask: Output mask updated with cache hit positions
+             **kwargs: Additional keyword arguments
+         """
++
++        tot_kv_size = 0
+         # location -> [(CacheEngineKey, start, end)]
+         block_mapping: Dict[str, List[Tuple[CacheEngineKey, int, int]]] = defaultdict(
+             list
+@@ -1031,7 +1048,7 @@ class LMCacheEngine:
+             )
+             for (key, start, end), memory_obj in zip(blocks, memory_objs, strict=False):
+                 if memory_obj is None:
+-                    logger.warn(
++                    logger.warning(
+                         "The cache block is in the storage, but it can't be retrieved"
+                     )
+                     if (
+@@ -1041,6 +1058,7 @@ class LMCacheEngine:
+                         last_failed_block_start = start
+                     break
+                 reordered_chunks.append((key, memory_obj, start, end))
++                tot_kv_size += memory_obj.get_size()
+ 
+         if last_failed_block_start is not None:
+             ret_mask[last_failed_block_start:] = False
+@@ -1050,7 +1068,7 @@ class LMCacheEngine:
+                 for key, memory_obj, start, end in reordered_chunks
+                 if end < last_failed_block_start
+             ]
+-        return reordered_chunks
++        return reordered_chunks, tot_kv_size
+ 
+     def _broadcast_or_receive_memory_objs(
+         self,
+diff --git a/lmcache/v1/storage_backend/connector/s3_adapter.py b/lmcache/v1/storage_backend/connector/s3_adapter.py
+index 7abd2ad..ecf2883 100644
+--- a/lmcache/v1/storage_backend/connector/s3_adapter.py
++++ b/lmcache/v1/storage_backend/connector/s3_adapter.py
+@@ -40,6 +40,7 @@ class S3ConnectorAdapter(ConnectorAdapter):
+             self.s3_enable_s3express = config.extra_config.get(
+                 "s3_enable_s3express", True
+             )
++            self.s3_file_prefix = config.extra_config.get("s3_file_prefix", None)
+ 
+         logger.info(f"Creating S3 connector for URL: {context.url}")
+ 
+@@ -50,6 +51,7 @@ class S3ConnectorAdapter(ConnectorAdapter):
+             loop=context.loop,
+             local_cpu_backend=context.local_cpu_backend,
+             s3_part_size=self.s3_part_size,
++            s3_file_prefix=self.s3_file_prefix,
+             s3_max_io_concurrency=self.s3_max_io_concurrency,
+             s3_max_inflight_reqs=self.s3_max_inflight_reqs,
+             s3_prefer_http2=self.s3_prefer_http2,
+diff --git a/lmcache/v1/storage_backend/connector/s3_connector.py b/lmcache/v1/storage_backend/connector/s3_connector.py
+index d3f2dd0..2c5adf6 100644
+--- a/lmcache/v1/storage_backend/connector/s3_connector.py
++++ b/lmcache/v1/storage_backend/connector/s3_connector.py
+@@ -88,6 +88,7 @@ class S3Connector(RemoteConnector):
+         loop: asyncio.AbstractEventLoop,
+         local_cpu_backend: LocalCPUBackend,
+         s3_part_size: Optional[int],
++        s3_file_prefix: Optional[str],
+         s3_max_io_concurrency: int,
+         s3_max_inflight_reqs: int,
+         s3_prefer_http2: bool,
+@@ -98,6 +99,7 @@ class S3Connector(RemoteConnector):
+             raise ValueError("S3 url must start with 's3://'")
+ 
+         self.s3_endpoint = s3_endpoint.removeprefix("s3://")
++        self.s3_prefix = s3_file_prefix
+         self.loop = loop
+         self.local_cpu_backend = local_cpu_backend
+ 
+@@ -193,13 +195,18 @@ class S3Connector(RemoteConnector):
+         that need to be URL-encoded.
+         """
+         flat_key_str = key_str.replace("/", "_")
+-        return url_quote(flat_key_str, safe="")
++        if self.s3_prefix:
++            path = f"/{self.s3_prefix}/{flat_key_str}"
++        else:
++            path = f"/{flat_key_str}"
++        # Keep slashes as they are path separators in S3.
++        return url_quote(path, safe="/")
+ 
+     # TODO(Jiayi): optimize this with async
+     def _get_object_size(self, key_str: str) -> int:
+         headers = HttpHeaders()
+         headers.add("Host", self.s3_endpoint)
+-        req = HttpRequest("HEAD", f"/{self._format_safe_path(key_str)}", headers)
++        req = HttpRequest("HEAD", self._format_safe_path(key_str), headers)
+ 
+         got = {"len": None, "status": None, "err": None}
+ 
+@@ -253,8 +260,6 @@ class S3Connector(RemoteConnector):
+     def _s3_download(
+         self,
+         key_str: str,
+-        obj_size: int,
+-        memory_obj: MemoryObj,
+         recv_path: str,
+         done_event: threading.Event,
+     ):
+@@ -268,7 +273,7 @@ class S3Connector(RemoteConnector):
+         # range_header = f"bytes={start_byte}-{end_byte}"
+         # headers.add("Range", range_header)
+ 
+-        req = HttpRequest("GET", f"/{self._format_safe_path(key_str)}", headers)
++        req = HttpRequest("GET", self._format_safe_path(key_str), headers)
+ 
+         # NOTE(Jiayi): Run in crt threads (not this thread) with GIL
+         # See https://github.com/awslabs/aws-crt-python/blob/4250709624119de1af3ca86816e1a154fcac7cc8/source/common.c#L51
+@@ -326,8 +331,6 @@ class S3Connector(RemoteConnector):
+ 
+         self._s3_download(
+             key_str=key_str,
+-            obj_size=obj_size,
+-            memory_obj=memory_obj,
+             recv_path=recv_path,
+             done_event=done_event,
+         )
+@@ -402,8 +405,6 @@ class S3Connector(RemoteConnector):
+             recv_path, shm = self.adhoc_shm_manager.allocate()
+             self._s3_download(
+                 key_str=key_str,
+-                obj_size=obj_size,
+-                memory_obj=memory_obj,
+                 recv_path=recv_path,
+                 done_event=done_event,
+             )
+@@ -438,7 +439,7 @@ class S3Connector(RemoteConnector):
+         headers = HttpHeaders()
+         headers.add("Host", self.s3_endpoint)
+ 
+-        req = HttpRequest("PUT", f"/{self._format_safe_path(key_str)}", headers)
++        req = HttpRequest("PUT", self._format_safe_path(key_str), headers)
+ 
+         done = {"err": None, "status": None}
+ 
+@@ -471,8 +472,6 @@ class S3Connector(RemoteConnector):
+ 
+         key_str = key.to_string()
+ 
+-        logger.debug(f"Uploading {key_str} to S3")
+-
+         # TODO(Jiayi): Please support this
+         assert memory_obj.get_physical_size() == self.s3_part_size, (
+             "Saving unfull chunk is not supported in S3Connector."
+-- 
+2.51.0
+
+From b7cee811bd22807d15b332cb0aa64de196fd7890 Mon Sep 17 00:00:00 2001
+From: Jiayi Yao <82156730+YaoJiayi@users.noreply.github.com>
+Date: Mon, 25 Aug 2025 09:59:19 -0700
+Subject: [PATCH] [Bugfix] Fix double semaphore acquire in s3 connector (#1427)
+
+fix semaphore
+
+Signed-off-by: YaoJiayi <120040070@link.cuhk.edu.cn>
+---
+ lmcache/v1/storage_backend/connector/s3_connector.py | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/lmcache/v1/storage_backend/connector/s3_connector.py b/lmcache/v1/storage_backend/connector/s3_connector.py
+index 2c5adf6..5a016d5 100644
+--- a/lmcache/v1/storage_backend/connector/s3_connector.py
++++ b/lmcache/v1/storage_backend/connector/s3_connector.py
+@@ -452,8 +452,6 @@ class S3Connector(RemoteConnector):
+ 
+             done_event.set()
+ 
+-        await self.inflight_sema.acquire()
+-
+         s3.S3Request(
+             client=self.s3_client,
+             type=s3.S3RequestType.PUT_OBJECT,
+-- 
+2.51.0
+
+From eb272a885d31499fe946974a1b8ce67364c66a07 Mon Sep 17 00:00:00 2001
+From: Samuel Shen <102553648+sammshen@users.noreply.github.com>
+Date: Fri, 29 Aug 2025 04:33:38 -0700
+Subject: [PATCH] [patch]: s3 mem leak (#1461)
+
+mem leak
+
+Signed-off-by: Samuel Shen <slshen@uchicago.edu>
+Co-authored-by: Samuel Shen <slshen@uchicago.edu>
+---
+ lmcache/v1/storage_backend/connector/s3_connector.py | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/lmcache/v1/storage_backend/connector/s3_connector.py b/lmcache/v1/storage_backend/connector/s3_connector.py
+index 60a8796..9c5eb8d 100644
+--- a/lmcache/v1/storage_backend/connector/s3_connector.py
++++ b/lmcache/v1/storage_backend/connector/s3_connector.py
+@@ -352,6 +352,7 @@ class S3Connector(RemoteConnector):
+     ) -> List[Optional[MemoryObj]]:
+         done_events = []
+         shms: list[Optional[int]] = []
++        recv_paths: list[Optional[str]] = []
+         memory_objs: list[Optional[MemoryObj]] = []
+         obj_sizes = []
+ 
+@@ -402,6 +403,7 @@ class S3Connector(RemoteConnector):
+             done_events.append(done_event)
+ 
+             recv_path, shm = self.adhoc_shm_manager.allocate()
++            recv_paths.append(recv_path)
+             self._s3_download(
+                 key_str=key_str,
+                 recv_path=recv_path,
+@@ -412,8 +414,8 @@ class S3Connector(RemoteConnector):
+         while not all(e.is_set() for e in done_events):
+             await asyncio.sleep(0.005)
+ 
+-        for obj_size, memory_obj, shm in zip(
+-            obj_sizes, memory_objs, shms, strict=False
++        for obj_size, memory_obj, shm, recv_path in zip(
++            obj_sizes, memory_objs, shms, recv_paths, strict=False
+         ):
+             if memory_obj is None or shm is None:
+                 continue
+-- 
+2.51.0
+
+From 525618e760bc7809b3bb09658497d75d55667f97 Mon Sep 17 00:00:00 2001
+From: Jiayi Yao <82156730+YaoJiayi@users.noreply.github.com>
+Date: Tue, 2 Sep 2025 13:13:31 -0700
+Subject: [PATCH] [Bugfix] Fix mem leak in S3 connector (#1495)
+
+fix mem leak by put
+
+Signed-off-by: YaoJiayi <120040070@link.cuhk.edu.cn>
+---
+ lmcache/v1/storage_backend/connector/s3_connector.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/lmcache/v1/storage_backend/connector/s3_connector.py b/lmcache/v1/storage_backend/connector/s3_connector.py
+index 9c5eb8d..dc97872 100644
+--- a/lmcache/v1/storage_backend/connector/s3_connector.py
++++ b/lmcache/v1/storage_backend/connector/s3_connector.py
+@@ -497,6 +497,7 @@ class S3Connector(RemoteConnector):
+             raise
+         finally:
+             self.inflight_sema.release()
++            self.adhoc_shm_manager.free(send_path, shm)
+             logger.debug(f"Uploaded {key_str} to S3 successfully")
+ 
+     async def list(self) -> List[str]:
+-- 
+2.51.0
+
+From fe20ff0196556669161688eaffd365904f100eb7 Mon Sep 17 00:00:00 2001
+From: Samuel Shen <102553648+sammshen@users.noreply.github.com>
+Date: Thu, 18 Sep 2025 11:17:38 -0700
+Subject: [PATCH] [feat]: working async s3 (#1614)
+
+* working async s3
+
+Signed-off-by: Samuel Shen <slshen@uchicago.edu>
+
+* Update docs/source/kv_cache/storage_backends/s3.rst
+
+Co-authored-by: gemini-code-assist[bot] <176961590+gemini-code-assist[bot]@users.noreply.github.com>
+Signed-off-by: Samuel Shen <102553648+sammshen@users.noreply.github.com>
+
+* Update docs/source/kv_cache/storage_backends/s3.rst
+
+Co-authored-by: gemini-code-assist[bot] <176961590+gemini-code-assist[bot]@users.noreply.github.com>
+Signed-off-by: Samuel Shen <102553648+sammshen@users.noreply.github.com>
+
+* change async interface
+
+Signed-off-by: Samuel Shen <slshen@uchicago.edu>
+
+* change async interface
+
+Signed-off-by: Samuel Shen <slshen@uchicago.edu>
+
+* lint again
+
+Signed-off-by: Samuel Shen <slshen@uchicago.edu>
+
+* remove extra config logging
+
+Signed-off-by: Samuel Shen <slshen@uchicago.edu>
+
+* move close() to the adhocsharedmemorymanager
+
+Signed-off-by: Samuel Shen <slshen@uchicago.edu>
+
+---------
+
+Signed-off-by: Samuel Shen <slshen@uchicago.edu>
+Signed-off-by: Samuel Shen <102553648+sammshen@users.noreply.github.com>
+Co-authored-by: Samuel Shen <slshen@uchicago.edu>
+Co-authored-by: gemini-code-assist[bot] <176961590+gemini-code-assist[bot]@users.noreply.github.com>
+---
+ docs/source/getting_started/installation.rst  |  19 +-
+ .../kv_cache/storage_backends/index.rst       |   1 +
+ docs/source/kv_cache/storage_backends/s3.rst  | 141 +++++++++
+ lmcache/v1/config.py                          |  10 +-
+ .../storage_backend/connector/s3_connector.py | 280 +++++++++++++-----
+ 5 files changed, 364 insertions(+), 87 deletions(-)
+ create mode 100644 docs/source/kv_cache/storage_backends/s3.rst
+
+diff --git a/docs/source/getting_started/installation.rst b/docs/source/getting_started/installation.rst
+index d49eeff..f966856 100644
+--- a/docs/source/getting_started/installation.rst
++++ b/docs/source/getting_started/installation.rst
+@@ -33,15 +33,16 @@ If you require a different version of torch for the LMCache instance that you bu
+ This compatibility matrix accounts for dependencies as well as connector API changes. Please raise an issue on GitHub if you encounter any incompatibilities.
+ 
+ .. csv-table::
+-   :header: "", "LMCache 0.3.5 (Aug 28)", "LMCache 0.3.4 (Aug 24)", "LMCache 0.3.3 (Aug 1)", "LMCache 0.3.2 (Jul 14)", "LMCache 0.3.1 (June 25)", "LMCache 0.3.0 (May 28)"
+-   :widths: 20, 15, 15, 15, 15, 15, 15
+-
+-   "vLLM 0.10.1.x (Aug 19)", "✅", "❌", "✅", "✅", "✅", "❌"
+-   "vLLM 0.10.0.x (Jul 24)", "✅", "❌", "✅", "✅", "✅", "❌"
+-   "vLLM 0.9.2.x (Jul 3)", "✅", "❌", "✅", "✅", "✅", "❌"
+-   "vLLM 0.9.1.x (June 10)", "✅", "❌", "✅", "✅", "❌", "❌"
+-   "vLLM 0.9.0.x (May 14)", "✅", "❌", "✅", "✅", "❌", "❌"
+-   "vLLM 0.8.5.x (Apr 28)", "✅", "❌", "✅", "✅", "❌", "✅"
++   :header: "", "LMCache 0.3.6 (Sep 15)", "LMCache 0.3.5 (Aug 28)", "LMCache 0.3.4 (Aug 24)", "LMCache 0.3.3 (Aug 1)", "LMCache 0.3.2 (Jul 14)", "LMCache 0.3.1 (June 25)", "LMCache 0.3.0 (May 28)"
++   :widths: 20, 15, 15, 15, 15, 15, 15, 15
++
++   "vLLM 0.10.2.x (Sep 13)", "✅", "✅", "❌", "✅", "✅", "✅", "❌"
++   "vLLM 0.10.1.x (Aug 19)", "❌", "✅", "❌", "✅", "✅", "✅", "❌"
++   "vLLM 0.10.0.x (Jul 24)", "❌", "✅", "❌", "✅", "✅", "✅", "❌"
++   "vLLM 0.9.2.x (Jul 3)", "❌", "✅", "❌", "✅", "✅", "✅", "❌"
++   "vLLM 0.9.1.x (June 10)", "❌", "✅", "❌", "✅", "✅", "❌", "❌"
++   "vLLM 0.9.0.x (May 14)", "❌", "✅", "❌", "✅", "✅", "❌", "❌"
++   "vLLM 0.8.5.x (Apr 28)", "❌", "✅", "❌", "✅", "✅", "❌", "✅"
+ 
+ 
+ Notable Change List: 
+diff --git a/docs/source/kv_cache/storage_backends/index.rst b/docs/source/kv_cache/storage_backends/index.rst
+index 3a95d80..981e70f 100644
+--- a/docs/source/kv_cache/storage_backends/index.rst
++++ b/docs/source/kv_cache/storage_backends/index.rst
+@@ -13,6 +13,7 @@ Supported Backends
+    local_storage
+    gds
+    redis
++   s3
+    infinistore
+    mooncake
+    valkey
+diff --git a/docs/source/kv_cache/storage_backends/s3.rst b/docs/source/kv_cache/storage_backends/s3.rst
+new file mode 100644
+index 0000000..4d9abec
+--- /dev/null
++++ b/docs/source/kv_cache/storage_backends/s3.rst
+@@ -0,0 +1,141 @@
++S3 Backend
++==========
++
++Example Configurations
++----------------------
++
++Basic S3 Configuration
++~~~~~~~~~~~~~~~~~~~~~~~
++
++.. code-block:: yaml
++
++   chunk_size: 256
++   local_cpu: False
++   save_unfull_chunk: False
++   remote_url: "s3://your-bucket-name"
++   remote_serde: "naive"
++   blocking_timeout_secs: 100
++   extra_config:
++     s3_region: "us-east-1"
++     s3_max_io_concurrency: 64
++     s3_max_inflight_reqs: 64
++
++S3 Express One Zone
++~~~~~~~~~~~~~~~~~~~
++
++.. code-block:: yaml
++
++   chunk_size: 256
++   local_cpu: False
++   save_unfull_chunk: False
++   remote_url: "s3://{BUCKET_NAME}.s3express-{AZ_ID}.{REGION}.amazonaws.com"
++   remote_serde: "naive"
++   blocking_timeout_secs: 100
++   extra_config:
++     s3_max_io_concurrency: 64
++     s3_max_inflight_reqs: 64
++     s3_prefer_http2: True
++     s3_region: "{REGION}"
++     s3_enable_s3express: True
++     s3_file_prefix: "{FILE_PREFIX}"
++
++CoreWeave (S3-compatible)
++~~~~~~~~~~~~~~~~~~~~~~~~~
++
++.. code-block:: yaml
++
++   chunk_size: 256
++   local_cpu: False
++   max_local_cpu_size: 50
++   save_unfull_chunk: False
++   enable_async_loading: True
++   remote_url: "s3://test-127.cwlota.com"
++   remote_serde: "naive"
++   blocking_timeout_secs: 100
++   extra_config:
++     s3_max_io_concurrency: 320
++     s3_max_inflight_reqs: 320
++     s3_prefer_http2: False
++     s3_region: "US-WEST-04A"
++     s3_enable_s3express: False
++     save_chunk_meta: False
++     s3_file_prefix: "test-2"
++
++**Note**: `cwlota.com` is CoreWeave's S3-compatible Cloud Storage that caches for GPU locality. Set `s3_enable_s3express: False` for non-AWS services.
++
++Configuration Parameters
++------------------------
++
++* **remote_url**: S3 bucket URL (`s3://bucket-name`)
++* **save_unfull_chunk**: Save partial chunks (default: True, **must be False for S3**)
++* **enable_async_loading**: Async loading (default: False)
++* **blocking_timeout_secs**: Timeout seconds (default: 10)
++
++S3-Specific (in extra_config)
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++* **s3_region**: AWS region for S3 client (required)
++* **s3_max_io_concurrency**: Max concurrent I/O operations for event loop group (controls AWS CRT threading)
++* **s3_max_inflight_reqs**: Max simultaneous S3 requests (creates this many /dev/shm buffers and semaphore limit)
++* **s3_prefer_http2**: Enable HTTP/2 with ALPN negotiation (["h2", "http/1.1"])
++* **s3_enable_s3express**: Enable S3 Express One Zone support in AWS CRT client
++* **s3_file_prefix**: Prefix for S3 object keys (e.g., `cache` becomes `/cache/key_name`). Avoid leading/trailing slashes.
++* **save_chunk_meta**: Whether to save chunk metadata with data (set False for performance)
++
++The effective concurrency is limited by the minimum of `s3_max_io_concurrency` and `s3_max_inflight_reqs`.
++
++/dev/shm Configuration
++----------------------
++
++/dev/shm is used as the tmpfs that S3 can use to transfer only into RAM instead of having to touch a block device. 
++
++Memory Requirements and Configuration Calculation
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++Calculate total memory needed:
++
++.. code-block::
++
++   # GB / token should be the aggregated size across TP workers of KV Cache size
++   (GB / token) * chunk_size * s3_max_inflight_reqs + max_local_cpu_size * num_tp_workers <= available_pinned_memory
++
++Calculate s3_max_inflight_reqs based on /dev/shm:
++
++.. code-block::
++
++   s3_max_inflight_reqs <= (GB in /dev/shm) / (chunk_size_GB_per_TP) / (TP_count)
++
++Check current size:
++
++.. code-block:: bash
++
++   df -h /dev/shm
++
++Increase size:
++
++.. code-block:: bash
++
++   sudo mount -o remount,size=256G /dev/shm
++
++Clean up LMCache files:
++
++.. code-block:: bash
++
++   rm -f /dev/shm/my_shm_*
++
++Troubleshooting
++---------------
++
++**Memory:**:
++
++- Check: `df -h /dev/shm`
++
++- Fix: Increase `/dev/shm` size or reduce `s3_max_inflight_reqs` or `max_local_cpu_size`
++
++- Clean: `rm -f /dev/shm/my_shm_*`
++
++**Latency**::
++
++- Use same region for compute and S3
++
++- Consider S3 Express One Zone
+\ No newline at end of file
+diff --git a/lmcache/v1/config.py b/lmcache/v1/config.py
+index 49463cc..49bb29a 100644
+--- a/lmcache/v1/config.py
++++ b/lmcache/v1/config.py
+@@ -476,7 +476,7 @@ def _from_defaults(cls, **kwargs):
+         config_values[name] = kwargs.get(name, config["default"])
+ 
+     instance = cls(**config_values)
+-    return instance.log_config()
++    return instance
+ 
+ 
+ def _from_legacy(cls, **kwargs):
+@@ -540,7 +540,7 @@ def _from_legacy(cls, **kwargs):
+             config_values[name] = config["default"]
+ 
+     instance = cls(**config_values)
+-    return instance.log_config()
++    return instance
+ 
+ 
+ def _from_file(cls, file_path: str):
+@@ -569,7 +569,7 @@ def _from_file(cls, file_path: str):
+         config_values[name] = value
+ 
+     instance = cls(**config_values)
+-    return instance.log_config()
++    return instance
+ 
+ 
+ def _update_config_from_env(self):
+@@ -614,7 +614,7 @@ def _from_env(cls):
+     """Load configuration from environment variables"""
+     instance = cls.from_defaults()
+     _update_config_from_env(instance)
+-    return instance.log_config()
++    return instance
+ 
+ 
+ def _from_dict(cls, config_dict: dict):
+@@ -627,7 +627,7 @@ def _from_dict(cls, config_dict: dict):
+             value = config["env_converter"](value)
+         config_values[name] = value
+     instance = cls(**config_values)
+-    return instance.log_config()
++    return instance
+ 
+ 
+ def _to_dict(self):
+diff --git a/lmcache/v1/storage_backend/connector/s3_connector.py b/lmcache/v1/storage_backend/connector/s3_connector.py
+index dc97872..12a79f3 100644
+--- a/lmcache/v1/storage_backend/connector/s3_connector.py
++++ b/lmcache/v1/storage_backend/connector/s3_connector.py
+@@ -1,5 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # Standard
++from enum import IntEnum, auto
++from functools import partial
+ from typing import List, Optional
+ from urllib.parse import quote as url_quote
+ import asyncio
+@@ -7,7 +9,6 @@ import ctypes
+ import mmap
+ import os
+ import tempfile
+-import threading
+ 
+ # Third Party
+ from awscrt import auth, io, s3
+@@ -19,11 +20,19 @@ from lmcache.logging import init_logger
+ from lmcache.utils import CacheEngineKey
+ from lmcache.v1.memory_management import MemoryObj
+ from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
++from lmcache.v1.storage_backend.job_executor.pq_executor import AsyncPQExecutor
+ from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+ 
+ logger = init_logger(__name__)
+ 
+ 
++class Priorities(IntEnum):
++    PEEK = auto()
++    PREFETCH = auto()
++    GET = auto()
++    PUT = auto()
++
++
+ # TODO(Jiayi): Some pending problems.
+ # (1) We might need a filesystem-like allocator.
+ # This could be useful for local disk `LocalDiskBackend` and
+@@ -76,6 +85,16 @@ class AdhocSharedMemoryManager:
+         self.shm_buffers.append(shm)
+         self.shm_names.append(shm_name)
+ 
++    def close(self):
++        # let python GC clean up mmap inodes
++        for mm in self.adhoc_shm_manager.mmaps:
++            mm.close()
++        for shm_name in self.adhoc_shm_manager.shm_names:
++            try:
++                os.unlink(shm_name)
++            except FileNotFoundError:
++                pass  # file probably already removed
++
+ 
+ class S3Connector(RemoteConnector):
+     """
+@@ -138,16 +157,20 @@ class S3Connector(RemoteConnector):
+             bootstrap=client_bootstrap,
+             region=s3_region,
+             credential_provider=self.credentials_provider,
+-            enable_s3express=True,
++            enable_s3express=False,  # enable for s3express
+             tls_connection_options=tls_opts,
++            tls_mode=s3.S3RequestTlsMode.DISABLED,  # only for non-AWS services
+         )
+ 
+         # TODO(Jiayi): We need to handle cache consistency issues in a systematic way
+         # across all connectors.
+         # We assume S3 cache is never evicted and read-only for now.
++        # the object size cache does not need protection because
++        # asyncio scheduling is cooperative and not preemptive
+         self.object_size_cache: dict[str, int] = {}
+ 
+         self.inflight_sema = asyncio.Semaphore(s3_max_inflight_reqs)
++        self.pq_executor = AsyncPQExecutor(loop)
+ 
+     def post_init(self):
+         logger.info("Post-initializing S3 connector")
+@@ -239,7 +262,55 @@ class S3Connector(RemoteConnector):
+             logger.debug(f"Exception in `_get_object_size`: {e}")
+             return 0
+         if got["err"] or got["status"] != 200:
+-            logger.warning("Encountering error in S3 HEAD request")
++            logger.warning(
++                "Encountering error in S3 HEAD request "
++                f"with error code: {got['status']}"
++            )
++            return 0
++        return got["len"] if got["len"] is not None else 0
++
++    # exactly the same as _get_object_size just awaiting an asyncio.Future
++    # instead of a concurrent.futures.Future
++    async def _get_object_size_async(self, key_str: str) -> int:
++        headers = HttpHeaders()
++        headers.add("Host", self.s3_endpoint)
++        req = HttpRequest("HEAD", self._format_safe_path(key_str), headers)
++
++        got = {"len": None, "status": None, "err": None}
++
++        def on_headers(status_code, headers, **kwargs):
++            got["status"] = status_code
++            for name, value in headers:
++                if name.lower() == "content-length":
++                    try:
++                        got["len"] = int(value)
++                    except Exception:
++                        pass
++
++        def on_done(error=None, **kwargs):
++            got["err"] = error
++
++        s3_req = s3.S3Request(
++            client=self.s3_client,
++            type=s3.S3RequestType.DEFAULT,
++            request=req,
++            operation_name="HeadObject",
++            on_headers=on_headers,
++            on_done=on_done,
++            credential_provider=self.credentials_provider,
++            region=self.s3_region,
++        )
++
++        try:
++            await asyncio.wrap_future(s3_req.finished_future)
++        except Exception as e:
++            logger.debug(f"Exception in `_get_object_size_async`: {e}")
++            return 0
++        if got["err"] or got["status"] != 200:
++            logger.warning(
++                "Encountering error in S3 HEAD request "
++                f"with error code: {got['status']}"
++            )
+             return 0
+         return got["len"] if got["len"] is not None else 0
+ 
+@@ -250,7 +321,7 @@ class S3Connector(RemoteConnector):
+     def exists_sync(self, key: CacheEngineKey) -> bool:
+         key_str = key.to_string()
+         if key_str in self.object_size_cache:
+-            return True
++            return self.object_size_cache[key_str] > 0
+         cache_size = self._get_object_size(key_str)
+         if cache_size > 0:
+             self.object_size_cache[key_str] = cache_size
+@@ -261,7 +332,6 @@ class S3Connector(RemoteConnector):
+         self,
+         key_str: str,
+         recv_path: str,
+-        done_event: threading.Event,
+     ):
+         """
+         Download a file from S3.
+@@ -284,11 +354,9 @@ class S3Connector(RemoteConnector):
+                     f"Failed to download {key_str} from S3: {error or status_code}"
+                 )
+ 
+-            done_event.set()
+-
+         # TODO(Jiayi): Need to support offset to enable zero-copy
+         # More concretely, we need to get the shared memory offset.
+-        s3.S3Request(
++        s3_req = s3.S3Request(
+             client=self.s3_client,
+             type=s3.S3RequestType.GET_OBJECT,
+             request=req,
+@@ -299,14 +367,17 @@ class S3Connector(RemoteConnector):
+             on_done=on_done,
+         )
+ 
++        return s3_req
++
+     async def get(self, key: CacheEngineKey) -> Optional[MemoryObj]:
+         key_str = key.to_string()
+ 
+         obj_size = self.object_size_cache.get(key_str, None)
+ 
+         if obj_size is None:
+-            obj_size = self._get_object_size(key_str)
++            obj_size = await self._get_object_size_async(key_str)
+             if obj_size <= 0:
++                self.object_size_cache[key_str] = 0
+                 return None
+             self.object_size_cache[key_str] = obj_size
+ 
+@@ -323,20 +394,16 @@ class S3Connector(RemoteConnector):
+             "Saving unfull chunk is not supported in S3Connector."
+         )
+ 
+-        done_event = threading.Event()
+-
+         # TODO(Jiayi): Need to support offset to enable zero-copy
+         # We probably need to get the shared memory offset directly from memory object.
+         recv_path, shm = self.adhoc_shm_manager.allocate()
+ 
+-        self._s3_download(
++        s3_req = self._s3_download(
+             key_str=key_str,
+             recv_path=recv_path,
+-            done_event=done_event,
+         )
+ 
+-        while not done_event.is_set():
+-            await asyncio.sleep(0.005)
++        await asyncio.wrap_future(s3_req.finished_future)
+ 
+         dst_ptr = memory_obj.data_ptr
+         ctypes.memmove(dst_ptr, shm, obj_size)
+@@ -347,20 +414,43 @@ class S3Connector(RemoteConnector):
+ 
+         return memory_obj
+ 
++    # this callback allows us to safely have multiple calls to batched_get
++    # since we release the semaphores 1-by-1
++    def on_get_done(
++        self,
++        obj_size: int,
++        memory_obj: MemoryObj,
++        shm: int,
++        recv_path: str,
++        fut: asyncio.Future,
++    ):
++        try:
++            if memory_obj is None or shm is None:
++                return None
++
++            dst_ptr = memory_obj.data_ptr
++            ctypes.memmove(dst_ptr, shm, obj_size)
++
++            self.adhoc_shm_manager.free(recv_path, shm)
++        except Exception as e:
++            logger.error(f"on_get_done failed for {recv_path}: {e}")
++        finally:
++            self.inflight_sema.release()
++
+     async def batched_get(
+         self, keys: List[CacheEngineKey]
+     ) -> List[Optional[MemoryObj]]:
+-        done_events = []
+-        shms: list[Optional[int]] = []
+-        recv_paths: list[Optional[str]] = []
+-        memory_objs: list[Optional[MemoryObj]] = []
+-        obj_sizes = []
+-
+-        # TODO(Jiayi): Need to resolve this
+-        assert len(keys) <= self.s3_max_inflight_reqs, (
+-            f"Too many keys {len(keys)} to get in a single pass, "
+-            f"max is {self.s3_max_inflight_reqs}"
+-        )
++        memory_objs: List[Optional[MemoryObj]] = []
++        futures = []
++
++        # It is okay for len(keys) > self.s3_max_inflight_reqs
++        # but it will be slower.
++        if len(keys) > self.s3_max_inflight_reqs:
++            logger.warning(
++                f"More keys {len(keys)} to get than "
++                f"max inflight requests {self.s3_max_inflight_reqs}.",
++                "This will cause slower retrieval.",
++            )
+ 
+         # TODO(Jiayi): Need some error handling in this loop.
+         for key in keys:
+@@ -369,15 +459,13 @@ class S3Connector(RemoteConnector):
+             obj_size = self.object_size_cache.get(key_str, None)
+ 
+             if obj_size is None:
+-                obj_size = self._get_object_size(key_str)
++                obj_size = await self._get_object_size_async(key_str)
+                 if obj_size <= 0:
+-                    obj_sizes.append(0)
++                    self.object_size_cache[key_str] = 0
+                     memory_objs.append(None)
++                    continue
+                 self.object_size_cache[key_str] = obj_size
+ 
+-            # TODO(Jiayi): A caveat of acquire this semaphore
+-            # is that we might face deadlock when `batched_put`
+-            # (not supported) is supported in the same fashion.
+             await self.inflight_sema.acquire()
+ 
+             memory_obj = self.local_cpu_backend.allocate(
+@@ -386,11 +474,9 @@ class S3Connector(RemoteConnector):
+                 self.meta_fmt,
+             )
+ 
+-            obj_sizes.append(obj_size)
+             memory_objs.append(memory_obj)
+ 
+             if not memory_obj:
+-                shms.append(None)
+                 self.inflight_sema.release()
+                 continue
+ 
+@@ -399,40 +485,25 @@ class S3Connector(RemoteConnector):
+                 "Saving unfull chunk is not supported in S3Connector."
+             )
+ 
+-            done_event = threading.Event()
+-            done_events.append(done_event)
+-
++            # freeing is done in on_get_done callback
+             recv_path, shm = self.adhoc_shm_manager.allocate()
+-            recv_paths.append(recv_path)
+-            self._s3_download(
++            s3_req = self._s3_download(
+                 key_str=key_str,
+                 recv_path=recv_path,
+-                done_event=done_event,
+             )
+-            shms.append(shm)
+-
+-        while not all(e.is_set() for e in done_events):
+-            await asyncio.sleep(0.005)
+-
+-        for obj_size, memory_obj, shm, recv_path in zip(
+-            obj_sizes, memory_objs, shms, recv_paths, strict=False
+-        ):
+-            if memory_obj is None or shm is None:
+-                continue
+-
+-            dst_ptr = memory_obj.data_ptr
+-            ctypes.memmove(dst_ptr, shm, obj_size)
+-
+-            self.adhoc_shm_manager.free(recv_path, shm)
+-            self.inflight_sema.release()
++            fut = asyncio.wrap_future(s3_req.finished_future)
++            fut.add_done_callback(
++                partial(self.on_get_done, obj_size, memory_obj, shm, recv_path)
++            )
++            futures.append(fut)
+ 
++        await asyncio.gather(*futures)
+         return memory_objs
+ 
+-    async def _s3_upload(
++    def _s3_upload(
+         self,
+         key_str: str,
+         send_path: str,
+-        done_event: threading.Event,
+     ):
+         """
+         Upload a file to S3.
+@@ -451,9 +522,7 @@ class S3Connector(RemoteConnector):
+             if done["err"] or done["status"] not in (200, 201):
+                 raise RuntimeError(f"Upload failed in S3Connector: {done}")
+ 
+-            done_event.set()
+-
+-        s3.S3Request(
++        s3_req = s3.S3Request(
+             client=self.s3_client,
+             type=s3.S3RequestType.PUT_OBJECT,
+             request=req,
+@@ -463,8 +532,9 @@ class S3Connector(RemoteConnector):
+             region=self.s3_region,
+             on_done=on_done,
+         )
++        return s3_req
+ 
+-    async def put(self, key: CacheEngineKey, memory_obj: MemoryObj):
++    async def _put(self, key: CacheEngineKey, memory_obj: MemoryObj):
+         """
+         Store data to S3
+         """
+@@ -483,22 +553,87 @@ class S3Connector(RemoteConnector):
+         try:
+             buffer_ptr = memory_obj.data_ptr
+             ctypes.memmove(shm, buffer_ptr, memory_obj.get_physical_size())
+-        except Exception as e:
+-            logger.error(f"Failed to copy data to S3 buffer: {e}")
+-        logger.debug("Data copy to S3 buffer completed")
++            logger.debug("Data copy to S3 buffer completed")
+ 
+-        try:
+-            done_event = threading.Event()
+-            await self._s3_upload(key_str, send_path, done_event)
+-            while not done_event.is_set():
+-                await asyncio.sleep(0.005)
++            s3_req = self._s3_upload(key_str, send_path)
++            await asyncio.wrap_future(s3_req.finished_future)
++
++            self.object_size_cache[key_str] = memory_obj.get_physical_size()
++            logger.debug(f"Uploaded {key_str} to S3 successfully")
+         except Exception as e:
+             logger.error(f"Failed to upload {key_str} to S3: {e}")
+             raise
+         finally:
+             self.inflight_sema.release()
+             self.adhoc_shm_manager.free(send_path, shm)
+-            logger.debug(f"Uploaded {key_str} to S3 successfully")
++
++    async def put(self, key: CacheEngineKey, memory_obj: MemoryObj):
++        return await self.pq_executor.submit_job(
++            self._put,
++            key=key,
++            memory_obj=memory_obj,
++            priority=Priorities.PUT,
++        )
++
++    def support_batched_async_contains(self) -> bool:
++        return True
++
++    async def _batched_async_contains(
++        self, lookup_id: str, keys: List[CacheEngineKey], pin: bool = False
++    ) -> int:
++        num_hit_counts = 0
++        for key in keys:
++            key_str = key.to_string()
++            cached_size = self.object_size_cache.get(key_str, None)
++            if cached_size is not None:
++                if cached_size > 0:
++                    num_hit_counts += 1
++                    continue
++                else:
++                    return num_hit_counts
++
++            obj_size = await self._get_object_size_async(key_str)
++            if not obj_size > 0:
++                self.object_size_cache[key_str] = 0
++                return num_hit_counts
++
++            self.object_size_cache[key_str] = obj_size
++            num_hit_counts += 1
++
++        return num_hit_counts
++
++    async def batched_async_contains(
++        self, lookup_id: str, keys: List[CacheEngineKey], pin: bool = False
++    ) -> int:
++        return await self.pq_executor.submit_job(
++            self._batched_async_contains,
++            lookup_id=lookup_id,
++            keys=keys,
++            pin=pin,
++            priority=Priorities.PEEK,
++        )
++
++    def support_batched_get_non_blocking(self) -> bool:
++        return True
++
++    async def _batched_get_non_blocking(
++        self,
++        lookup_id: str,
++        keys: List[CacheEngineKey],
++    ) -> List[MemoryObj]:
++        # batched get is already a coroutine
++        result = await self.batched_get(keys)
++        return [r for r in result if r is not None]
++
++    async def batched_get_non_blocking(
++        self, lookup_id: str, keys: List[CacheEngineKey]
++    ) -> List[MemoryObj]:
++        return await self.pq_executor.submit_job(
++            self._batched_get_non_blocking,
++            lookup_id=lookup_id,
++            keys=keys,
++            priority=Priorities.PREFETCH,
++        )
+ 
+     async def list(self) -> List[str]:
+         raise NotImplementedError
+@@ -514,6 +649,5 @@ class S3Connector(RemoteConnector):
+         return True
+ 
+     async def close(self):
+-        for shm in self.shms:
+-            shm.close()
+-            shm.unlink()
++        await self.pq_executor.shutdown(wait=True)
++        self.adhoc_shm_manager.close()
+-- 
+2.51.0
+

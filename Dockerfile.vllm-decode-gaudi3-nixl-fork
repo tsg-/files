@@ -93,15 +93,41 @@ WORKDIR ${TOPDIR}/vllm
 # Install build requirements (excluding torch to reuse Habana's torch)
 # Use BuildKit cache mount to speed up pip downloads
 RUN --mount=type=cache,target=/root/.cache/pip \
+    echo "=== [VLLM BUILD] Checking torch version before installing build requirements ===" && \
+    pip show torch || echo "torch not installed yet" && \
     grep -v '^torch' requirements/build.txt > /tmp/build_requirements.txt && \
-    pip install -r /tmp/build_requirements.txt && \
-    rm /tmp/build_requirements.txt
+    echo "=== [VLLM BUILD] Installing build requirements (torch excluded) ===" && \
+    pip install -v -r /tmp/build_requirements.txt && \
+    rm /tmp/build_requirements.txt && \
+    echo "=== [VLLM BUILD] Checking torch version after installing build requirements ===" && \
+    pip show torch
+
+# Install vLLM runtime requirements (excluding torch)
+# Process hpu.txt in place to preserve relative paths like '-r common.txt'
+RUN --mount=type=cache,target=/root/.cache/pip \
+    echo "=== [VLLM HPU] Checking torch version before installing HPU requirements ===" && \
+    pip show torch && \
+    if [ -f requirements/hpu.txt ]; then \
+        sed '/^torch$/d; /^torch[>=<~!]/d; /^torch /d' requirements/hpu.txt > /tmp/hpu_requirements.txt && \
+        mv /tmp/hpu_requirements.txt requirements/hpu_filtered.txt && \
+        echo "=== [VLLM HPU] Installing HPU requirements (torch excluded) ===" && \
+        cat requirements/hpu_filtered.txt && \
+        pip install -v -r requirements/hpu_filtered.txt || true; \
+    fi && \
+    echo "=== [VLLM HPU] Checking torch version after installing HPU requirements ===" && \
+    pip show torch
 
 # Build vLLM with Gaudi support (vllm-fork already has Gaudi support built-in)
 # Note: vllm-fork is assumed to be the HPU/Gaudi-enabled version
+# Use --no-deps to prevent pip from installing torch dependencies
 ENV VLLM_TARGET_DEVICE=hpu
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-build-isolation -e .
+    echo "=== [VLLM INSTALL] Checking torch version before vLLM installation ===" && \
+    pip show torch && \
+    echo "=== [VLLM INSTALL] Installing vLLM with --no-deps to prevent torch replacement ===" && \
+    pip install -v --no-build-isolation --no-deps -e . && \
+    echo "=== [VLLM INSTALL] Checking torch version after vLLM installation ===" && \
+    pip show torch
 
 # =============================================================================
 # Install LMCache (using local fork with HPU support)
@@ -116,19 +142,43 @@ COPY LMCache-fork/ ${TOPDIR}/LMCache/
 
 WORKDIR ${TOPDIR}/LMCache
 
-# Install build requirements
+# Install build requirements (excluding torch to reuse Habana's torch)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r requirements/build.txt || true
+    echo "=== [LMCACHE BUILD] Checking torch version before installing build requirements ===" && \
+    pip show torch && \
+    grep -v '^torch' requirements/build.txt > /tmp/lmcache_build_requirements.txt && \
+    echo "=== [LMCACHE BUILD] Installing build requirements (torch excluded) ===" && \
+    pip install -v -r /tmp/lmcache_build_requirements.txt || true && \
+    rm /tmp/lmcache_build_requirements.txt && \
+    echo "=== [LMCACHE BUILD] Checking torch version after installing build requirements ===" && \
+    pip show torch
 
 # Install LMCache with HPU/Gaudi support
-# PT_HPU_GPU_MIGRATION=1 enables GPU-to-HPU migration layer
-ENV PT_HPU_GPU_MIGRATION=1
+# PT_HPU_GPU_MIGRATION=1 enables GPU-to-HPU migration layer during build only
+# Use --no-build-isolation to prevent pip from installing torch==2.7.1 from pyproject.toml
+# NOTE: We don't set PT_HPU_GPU_MIGRATION globally to avoid runtime conflicts
 RUN --mount=type=cache,target=/root/.cache/pip \
-    PT_HPU_GPU_MIGRATION=1 pip install -e .
+    echo "=== [LMCACHE INSTALL] Checking torch version before LMCache installation ===" && \
+    pip show torch && \
+    echo "=== [LMCACHE INSTALL] Installing LMCache with --no-build-isolation to preserve Habana torch ===" && \
+    PT_HPU_GPU_MIGRATION=1 pip install -v --no-build-isolation -e . && \
+    echo "=== [LMCACHE INSTALL] Checking torch version after LMCache installation ===" && \
+    pip show torch
 
 # Verify LMCache installation
 RUN python -c "import lmcache; print('LMCache installed successfully')" 2>/dev/null || \
     echo "LMCache not available (will use vLLM prefix caching only)"
+
+# Fix AutoConfig registration conflicts in vLLM
+# Add exist_ok=True to prevent conflicts when configs are registered multiple times
+RUN sed -i 's/AutoConfig.register("aimv2", AIMv2Config)/AutoConfig.register("aimv2", AIMv2Config, exist_ok=True)/' /workspace/vllm/vllm/transformers_utils/configs/ovis.py && \
+    sed -i 's/AutoConfig.register("aimv2_visual_tokenizer", Aimv2VisualTokenizerConfig)/AutoConfig.register("aimv2_visual_tokenizer", Aimv2VisualTokenizerConfig, exist_ok=True)/' /workspace/vllm/vllm/transformers_utils/configs/ovis.py
+
+# Final torch verification
+RUN echo "=== [FINAL] Final torch package verification ===" && \
+    pip show torch && \
+    echo "=== [FINAL] Torch location and version ===" && \
+    python -c "import torch; print(f'Torch version: {torch.__version__}'); print(f'Torch location: {torch.__file__}'); print(f'HPU available: {torch.hpu.is_available() if hasattr(torch, \"hpu\") else \"N/A\"}')"
 
 # =============================================================================
 # Update benchmark scripts for Gaudi3
