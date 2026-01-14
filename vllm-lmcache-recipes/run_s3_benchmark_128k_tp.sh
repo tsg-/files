@@ -125,8 +125,6 @@ export PYTHONPATH=/opt/habanalabs/qual/diag_tool:/opt/habanalabs/qual/diag_tool/
 export HF_HOME=/root/.cache/huggingface
 export HF_HUB_CACHE=/root/.cache/huggingface/hub
 export HUGGINGFACE_HUB_CACHE=/root/.cache/huggingface/hub
-export HF_TOKEN=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
-export HUGGING_FACE_HUB_TOKEN=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
 EOF
 
     if [[ -n "${lmcache_config}" ]]; then
